@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-// Sichere API für Renderer Process
+// Sichere API für Renderer Process - Wareneinlagerung
 contextBridge.exposeInMainWorld('electronAPI', {
     // ===== DATENBANK OPERATIONEN =====
     db: {
@@ -9,10 +9,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
         getUserById: (userId) => ipcRenderer.invoke('db-get-user-by-id', userId)
     },
 
-    // ===== SESSION MANAGEMENT =====
+    // ===== PARALLELES SESSION MANAGEMENT =====
     session: {
+        // Alle aktiven Sessions abrufen
+        getAllActive: () => ipcRenderer.invoke('session-get-all-active'),
+
+        // Neue Session erstellen (ohne bestehende zu beenden)
         create: (userId) => ipcRenderer.invoke('session-create', userId),
-        end: (sessionId) => ipcRenderer.invoke('session-end', sessionId)
+
+        // Session neu starten (Timer zurücksetzen)
+        restart: (sessionId, userId) => ipcRenderer.invoke('session-restart', sessionId, userId),
+
+        // Spezifische Session beenden
+        end: (sessionId, userId) => ipcRenderer.invoke('session-end', sessionId, userId)
     },
 
     // ===== QR-CODE OPERATIONEN MIT DEKODIERUNG =====
@@ -43,17 +52,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
         getSystemInfo: () => ipcRenderer.invoke('get-system-info')
     },
 
-    // ===== EVENT LISTENERS =====
+    // ===== EVENT LISTENERS - WARENEINLAGERUNG =====
     on: (channel, callback) => {
         const validChannels = [
             'system-ready',
             'system-error',
-            'user-login',
-            'user-logout',
+            'user-login',           // Neuer Benutzer loggt sich ein
+            'user-logout',          // Benutzer loggt sich aus
+            'session-restarted',    // Session wurde neu gestartet (RFID-Rescan)
+            'session-timer-update', // Timer-Updates für Sessions
             'rfid-scan-error',
             'qr-scan-detected',
-            'decoding-stats-updated',
-            'session-reset-before-login' // ← Neues Event für RFID-Benutzerwechsel
+            'decoding-stats-updated'
         ];
 
         if (validChannels.includes(channel)) {
@@ -72,10 +82,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
             'system-error',
             'user-login',
             'user-logout',
+            'session-restarted',
+            'session-timer-update',
             'rfid-scan-error',
             'qr-scan-detected',
-            'decoding-stats-updated',
-            'session-reset-before-login' // ← Neues Event für RFID-Benutzerwechsel
+            'decoding-stats-updated'
         ];
 
         if (validChannels.includes(channel)) {
@@ -107,7 +118,7 @@ contextBridge.exposeInMainWorld('cameraAPI', {
     }
 });
 
-// ===== VERBESSERTE UTILITY FUNKTIONEN MIT QR-CODE DEKODIERUNG =====
+// ===== ERWEITERTE UTILITY FUNKTIONEN FÜR WARENEINLAGERUNG =====
 contextBridge.exposeInMainWorld('utils', {
     // ===== ZEIT & DATUM FORMATIERUNG =====
     formatDuration: (seconds) => {
@@ -210,6 +221,24 @@ contextBridge.exposeInMainWorld('utils', {
     },
 
     getCurrentTimestamp: () => new Date().toISOString(),
+
+    // ===== SESSION DURATION BERECHNUNG =====
+    calculateSessionDuration: (startTime) => {
+        try {
+            const start = new Date(startTime);
+            const now = new Date();
+
+            if (isNaN(start.getTime())) {
+                return 0;
+            }
+
+            const diffMs = now.getTime() - start.getTime();
+            return Math.max(0, Math.floor(diffMs / 1000));
+        } catch (error) {
+            console.error('Fehler bei Session-Duration-Berechnung:', error);
+            return 0;
+        }
+    },
 
     // ===== RFID TAG VALIDIERUNG =====
     validateTagId: (tagId) => {
@@ -685,6 +714,47 @@ contextBridge.exposeInMainWorld('utils', {
         };
     },
 
+    // ===== PARALLELE SESSION UTILITIES =====
+    formatSessionInfo: (session) => {
+        if (!session) return null;
+
+        const duration = this.calculateSessionDuration(session.StartTS || session.localStartTime);
+
+        return {
+            id: session.ID,
+            userId: session.UserID,
+            userName: session.UserName || 'Unbekannt',
+            department: session.Department || '',
+            sessionType: session.SessionTypeName || 'Wareneinlagerung',
+            startTime: session.StartTS || session.localStartTime,
+            duration: duration,
+            durationFormatted: this.formatDuration(duration),
+            scanCount: session.ScanCount || 0,
+            isActive: session.Active === 1 || session.Active === true
+        };
+    },
+
+    groupSessionsByUser: (sessions) => {
+        const grouped = {};
+
+        sessions.forEach(session => {
+            const userId = session.UserID;
+            if (!grouped[userId]) {
+                grouped[userId] = {
+                    user: {
+                        id: userId,
+                        name: session.UserName || 'Unbekannt',
+                        department: session.Department || ''
+                    },
+                    sessions: []
+                };
+            }
+            grouped[userId].sessions.push(this.formatSessionInfo(session));
+        });
+
+        return grouped;
+    },
+
     // ===== COPY TO CLIPBOARD FUNKTIONALITÄT =====
     copyToClipboard: async (text) => {
         try {
@@ -885,7 +955,7 @@ contextBridge.exposeInMainWorld('config', {
     theme: {
         get: () => {
             try {
-                return localStorage.getItem('wareneingang-theme') || 'auto';
+                return localStorage.getItem('wareneinlagerung-theme') || 'auto';
             } catch {
                 return 'auto';
             }
@@ -893,7 +963,7 @@ contextBridge.exposeInMainWorld('config', {
 
         set: (theme) => {
             try {
-                localStorage.setItem('wareneingang-theme', theme);
+                localStorage.setItem('wareneinlagerung-theme', theme);
                 document.body.className = document.body.className.replace(/theme-\w+/g, '');
 
                 if (theme === 'auto') {
@@ -954,7 +1024,7 @@ contextBridge.exposeInMainWorld('diagnostics', {
                     try {
                         return {
                             available: typeof Storage !== 'undefined',
-                            theme: localStorage.getItem('wareneingang-theme')
+                            theme: localStorage.getItem('wareneinlagerung-theme')
                         };
                     } catch {
                         return { available: false };
@@ -993,13 +1063,13 @@ document.addEventListener('DOMContentLoaded', () => {
     console.log('Preload Script geladen, DOM bereit');
 
     // Theme initialisieren
-    const savedTheme = localStorage.getItem('wareneingang-theme') || 'auto';
+    const savedTheme = localStorage.getItem('wareneinlagerung-theme') || 'auto';
     config.theme.set(savedTheme);
 
     // System Theme Changes verfolgen
     if (window.matchMedia) {
         window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
-            const currentTheme = localStorage.getItem('wareneingang-theme') || 'auto';
+            const currentTheme = localStorage.getItem('wareneinlagerung-theme') || 'auto';
             if (currentTheme === 'auto') {
                 config.theme.set('auto'); // Theme neu anwenden
             }
@@ -1057,7 +1127,7 @@ document.addEventListener('DOMContentLoaded', () => {
         originalConsoleWarn.apply(console, args);
     };
 
-    console.log('✅ Preload Script erfolgreich initialisiert mit QR-Code Dekodierung und Session-Reset Support');
+    console.log('✅ Preload Script erfolgreich initialisiert für Wareneinlagerung mit parallelen Sessions');
 });
 
-console.log('Preload Script mit QR-Code Dekodierung und Session-Reset Support geladen');
+console.log('Preload Script für Wareneinlagerung mit parallelen Sessions geladen');

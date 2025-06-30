@@ -1,9 +1,9 @@
 /**
- * Modular Database Client
+ * Modular Database Client für Wareneinlagerung
  * Composition of specialized database modules for better maintainability
+ * Angepasst für parallele Sessions und RFID-Session-Restart-Logik
  *
- * This new version maintains full backwards compatibility while providing
- * a cleaner, more maintainable architecture through module composition.
+ * This version supports multiple parallel sessions and RFID session restart functionality.
  */
 
 // ===== CORE IMPORTS =====
@@ -21,9 +21,9 @@ const HealthModule = require('./health/db-health');
 const SessionTypeConstants = require('./constants/session-types');
 
 /**
- * Enhanced Database Client with Modular Architecture
+ * Enhanced Database Client with Modular Architecture für Wareneinlagerung
  *
- * Maintains full backwards compatibility with the original DatabaseClient
+ * Supports multiple parallel sessions and RFID session restart functionality
  * while providing better code organization through specialized modules.
  */
 class DatabaseClient {
@@ -38,6 +38,10 @@ class DatabaseClient {
         this.qrscans = new QRScanModule(this.connection, this.utils);
         this.stats = new StatsModule(this.connection, this.utils);
         this.health = new HealthModule(this.connection, this.utils);
+
+        // ===== WARENEINLAGERUNG-SPEZIFISCHE KONFIGURATION =====
+        this.multiSessionMode = true; // Aktiviert parallele Sessions
+        this.allowSessionRestart = true; // Erlaubt RFID-Session-Restart
 
         // ===== BACKWARDS COMPATIBILITY PROPERTIES =====
         // Expose connection properties for compatibility
@@ -119,10 +123,122 @@ class DatabaseClient {
         return await this.users.getUserActivity(userId, limit);
     }
 
-    // ===== SESSION OPERATIONS (DELEGATED) =====
+    // ===== SESSION OPERATIONS (DELEGATED & ERWEITERT) =====
 
-    async createSession(userId, sessionType = 'Wareneingang') {
+    /**
+     * Erstellt eine neue Session für Wareneinlagerung
+     * @param {number} userId - Benutzer ID
+     * @param {string} sessionType - Session-Typ (default: 'Wareneinlagerung')
+     * @returns {Object} - Session-Daten
+     */
+    async createSession(userId, sessionType = 'Wareneinlagerung') {
         return await this.sessions.createSession(userId, sessionType);
+    }
+
+    /**
+     * WARENEINLAGERUNG-SPEZIFISCH: Session für Benutzer neu starten
+     * Setzt die StartTime auf aktuelle Zeit zurück, ohne die Session zu beenden
+     * @param {number} sessionId - Session ID
+     * @returns {Object} - Aktualisierte Session-Daten
+     */
+    async restartSession(sessionId) {
+        try {
+            const result = await this.query(`
+                UPDATE Sessions 
+                SET StartTime = GETDATE()
+                OUTPUT INSERTED.ID, INSERTED.UserID, INSERTED.StartTime, INSERTED.Active
+                WHERE ID = ? AND Active = 1
+            `, [sessionId]);
+
+            if (result.recordset.length === 0) {
+                throw new Error(`Session ${sessionId} nicht gefunden oder nicht aktiv`);
+            }
+
+            const updatedSession = result.recordset[0];
+            console.log(`✅ Session ${sessionId} neu gestartet für Benutzer ${updatedSession.UserID}`);
+
+            return {
+                ID: updatedSession.ID,
+                UserID: updatedSession.UserID,
+                StartTS: this.utils.normalizeTimestamp(updatedSession.StartTime),
+                Active: updatedSession.Active,
+                restarted: true
+            };
+
+        } catch (error) {
+            console.error('Fehler beim Neustarten der Session:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * WARENEINLAGERUNG-SPEZIFISCH: Prüft ob Benutzer bereits aktive Session hat
+     * @param {number} userId - Benutzer ID
+     * @returns {Object|null} - Aktive Session oder null
+     */
+    async getActiveSessionByUserId(userId) {
+        try {
+            const result = await this.query(`
+                SELECT s.ID, s.UserID, s.StartTime, s.EndTime, s.Active,
+                       u.BenutzerName as UserName
+                FROM Sessions s
+                INNER JOIN ScannBenutzer u ON s.UserID = u.ID
+                WHERE s.UserID = ? AND s.Active = 1
+            `, [userId]);
+
+            if (result.recordset.length === 0) {
+                return null;
+            }
+
+            const session = result.recordset[0];
+            return {
+                ID: session.ID,
+                UserID: session.UserID,
+                UserName: session.UserName,
+                StartTime: this.utils.normalizeTimestamp(session.StartTime),
+                EndTime: session.EndTime ? this.utils.normalizeTimestamp(session.EndTime) : null,
+                Active: session.Active
+            };
+
+        } catch (error) {
+            console.error('Fehler beim Abrufen der aktiven Session:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * WARENEINLAGERUNG-SPEZIFISCH: Alle aktiven Sessions abrufen
+     * @returns {Array} - Array aller aktiven Sessions
+     */
+    async getActiveSessions() {
+        try {
+            const result = await this.query(`
+                SELECT s.ID, s.UserID, s.StartTime, s.EndTime, s.Active,
+                       u.BenutzerName as UserName, u.Department,
+                       COUNT(qr.ID) as ScanCount
+                FROM Sessions s
+                INNER JOIN ScannBenutzer u ON s.UserID = u.ID
+                LEFT JOIN QrScans qr ON s.ID = qr.SessionID
+                WHERE s.Active = 1
+                GROUP BY s.ID, s.UserID, s.StartTime, s.EndTime, s.Active, u.BenutzerName, u.Department
+                ORDER BY s.StartTime ASC
+            `);
+
+            return result.recordset.map(session => ({
+                ID: session.ID,
+                UserID: session.UserID,
+                UserName: session.UserName,
+                Department: session.Department,
+                StartTime: this.utils.normalizeTimestamp(session.StartTime),
+                EndTime: session.EndTime ? this.utils.normalizeTimestamp(session.EndTime) : null,
+                Active: session.Active,
+                ScanCount: session.ScanCount || 0
+            }));
+
+        } catch (error) {
+            console.error('Fehler beim Abrufen aktiver Sessions:', error);
+            throw error;
+        }
     }
 
     async getSessionWithType(sessionId) {
@@ -138,12 +254,59 @@ class DatabaseClient {
     }
 
     /**
-     * ===== NEUE METHODE: ALLE AKTIVEN SESSIONS BEENDEN =====
-     * Beendet alle aktiven Sessions - für Single-User-Mode
+     * ANGEPASST FÜR WARENEINLAGERUNG: Beendet ALLE aktiven Sessions (nur für Notfälle)
+     * Im normalen Wareneinlagerung-Betrieb sollte dies NICHT verwendet werden
      * @returns {Object} - Erfolg, Anzahl beendeter Sessions und betroffene Benutzer
      */
     async endAllActiveSessions() {
-        return await this.sessions.endAllActiveSessions();
+        console.warn('⚠️ WARNUNG: endAllActiveSessions() aufgerufen in Wareneinlagerung-Modus!');
+        console.warn('⚠️ Dies sollte nur in Notfällen verwendet werden, da Wareneinlagerung parallele Sessions unterstützt.');
+
+        try {
+            // Zuerst alle aktiven Sessions abrufen für Logging
+            const activeSessions = await this.getActiveSessions();
+
+            if (activeSessions.length === 0) {
+                return {
+                    success: true,
+                    endedCount: 0,
+                    endedUsers: [],
+                    message: 'Keine aktiven Sessions gefunden'
+                };
+            }
+
+            // Alle aktiven Sessions beenden
+            const result = await this.query(`
+                UPDATE Sessions
+                SET EndTime = GETDATE(), Active = 0
+                OUTPUT INSERTED.ID, INSERTED.UserID
+                WHERE Active = 1
+            `);
+
+            const endedUsers = activeSessions.map(session => ({
+                sessionId: session.ID,
+                userId: session.UserID,
+                userName: session.UserName
+            }));
+
+            console.log(`🚨 NOTFALL: ${result.recordset.length} aktive Sessions in Wareneinlagerung beendet`);
+
+            return {
+                success: true,
+                endedCount: result.recordset.length,
+                endedUsers: endedUsers,
+                message: `${result.recordset.length} Sessions in Notfall beendet`
+            };
+
+        } catch (error) {
+            console.error('Fehler beim Beenden aller aktiven Sessions:', error);
+            return {
+                success: false,
+                endedCount: 0,
+                endedUsers: [],
+                error: error.message
+            };
+        }
     }
 
     async getActiveSession(userId) {
@@ -239,6 +402,108 @@ class DatabaseClient {
         return await this.stats.getDashboardData(timeframe);
     }
 
+    // ===== WARENEINLAGERUNG-SPEZIFISCHE STATISTIKEN =====
+
+    /**
+     * Statistiken für parallele Sessions
+     * @returns {Object} - Parallele Session-Statistiken
+     */
+    async getParallelSessionStats() {
+        try {
+            const result = await this.query(`
+                SELECT 
+                    COUNT(*) as ActiveSessionCount,
+                    COUNT(DISTINCT UserID) as ActiveUserCount,
+                    AVG(DATEDIFF(MINUTE, StartTime, GETDATE())) as AvgSessionDurationMinutes,
+                    SUM(qr.ScanCount) as TotalActiveScans
+                FROM Sessions s
+                LEFT JOIN (
+                    SELECT SessionID, COUNT(*) as ScanCount
+                    FROM QrScans
+                    WHERE ScanTime >= DATEADD(DAY, -1, GETDATE())
+                    GROUP BY SessionID
+                ) qr ON s.ID = qr.SessionID
+                WHERE s.Active = 1
+            `);
+
+            const stats = result.recordset[0];
+            return {
+                activeSessionCount: stats.ActiveSessionCount || 0,
+                activeUserCount: stats.ActiveUserCount || 0,
+                avgSessionDurationMinutes: Math.round(stats.AvgSessionDurationMinutes || 0),
+                totalActiveScans: stats.TotalActiveScans || 0,
+                timestamp: new Date().toISOString()
+            };
+
+        } catch (error) {
+            console.error('Fehler beim Abrufen der parallelen Session-Statistiken:', error);
+            return {
+                activeSessionCount: 0,
+                activeUserCount: 0,
+                avgSessionDurationMinutes: 0,
+                totalActiveScans: 0,
+                error: error.message,
+                timestamp: new Date().toISOString()
+            };
+        }
+    }
+
+    /**
+     * Session-Restart-Statistiken
+     * @param {number} days - Anzahl Tage rückblickend (default: 7)
+     * @returns {Object} - Session-Restart-Statistiken
+     */
+    async getSessionRestartStats(days = 7) {
+        try {
+            // Da wir keine explizite Restart-Spalte haben, schätzen wir Restarts
+            // basierend auf Sessions mit sehr kurzer Dauer gefolgt von neuen Sessions
+            const result = await this.query(`
+                WITH SessionDurations AS (
+                    SELECT 
+                        UserID,
+                        StartTime,
+                        LEAD(StartTime) OVER (PARTITION BY UserID ORDER BY StartTime) as NextStartTime,
+                        DATEDIFF(MINUTE, StartTime, ISNULL(EndTime, GETDATE())) as DurationMinutes
+                    FROM Sessions
+                    WHERE StartTime >= DATEADD(DAY, -?, GETDATE())
+                )
+                SELECT 
+                    COUNT(*) as TotalSessions,
+                    COUNT(CASE WHEN DurationMinutes < 2 AND NextStartTime IS NOT NULL 
+                               AND DATEDIFF(MINUTE, StartTime, NextStartTime) < 5 
+                               THEN 1 END) as EstimatedRestarts,
+                    AVG(DurationMinutes) as AvgSessionDuration,
+                    COUNT(DISTINCT UserID) as UsersWithSessions
+                FROM SessionDurations
+            `, [days]);
+
+            const stats = result.recordset[0];
+            return {
+                totalSessions: stats.TotalSessions || 0,
+                estimatedRestarts: stats.EstimatedRestarts || 0,
+                restartRate: stats.TotalSessions > 0 ?
+                    Math.round((stats.EstimatedRestarts / stats.TotalSessions) * 100) : 0,
+                avgSessionDurationMinutes: Math.round(stats.AvgSessionDuration || 0),
+                usersWithSessions: stats.UsersWithSessions || 0,
+                daysAnalyzed: days,
+                timestamp: new Date().toISOString()
+            };
+
+        } catch (error) {
+            console.error('Fehler beim Abrufen der Session-Restart-Statistiken:', error);
+            return {
+                totalSessions: 0,
+                estimatedRestarts: 0,
+                restartRate: 0,
+                avgSessionDurationMinutes: 0,
+                usersWithSessions: 0,
+                daysAnalyzed: days,
+                error: error.message,
+                timestamp: new Date().toISOString()
+            };
+        }
+    }
+
     // ===== HEALTH & DIAGNOSTICS (DELEGATED) =====
 
     async healthCheck() {
@@ -254,7 +519,20 @@ class DatabaseClient {
     }
 
     async debugInfo() {
-        return await this.health.debugInfo();
+        const baseInfo = await this.health.debugInfo();
+
+        // Wareneinlagerung-spezifische Debug-Informationen hinzufügen
+        const wareneinlagerungInfo = {
+            multiSessionMode: this.multiSessionMode,
+            allowSessionRestart: this.allowSessionRestart,
+            parallelSessionStats: await this.getParallelSessionStats(),
+            sessionRestartStats: await this.getSessionRestartStats(1) // Letzte 24h
+        };
+
+        return {
+            ...baseInfo,
+            wareneinlagerung: wareneinlagerungInfo
+        };
     }
 
     async getPerformanceStats() {
@@ -270,11 +548,69 @@ class DatabaseClient {
     }
 
     async checkSystemHealth() {
-        return await this.health.checkSystemHealth();
+        const baseHealth = await this.health.checkSystemHealth();
+
+        // Wareneinlagerung-spezifische Gesundheitsprüfungen
+        try {
+            const parallelStats = await this.getParallelSessionStats();
+            const wareneinlagerungHealth = {
+                parallelSessionsOperational: parallelStats.activeSessionCount >= 0,
+                multiUserMode: this.multiSessionMode,
+                sessionRestartEnabled: this.allowSessionRestart,
+                recommendedMaxParallelSessions: 10,
+                currentParallelSessions: parallelStats.activeSessionCount,
+                parallelSessionWarning: parallelStats.activeSessionCount > 15
+            };
+
+            return {
+                ...baseHealth,
+                wareneinlagerung: wareneinlagerungHealth
+            };
+        } catch (error) {
+            return {
+                ...baseHealth,
+                wareneinlagerung: {
+                    error: `Wareneinlagerung-Gesundheitsprüfung fehlgeschlagen: ${error.message}`,
+                    parallelSessionsOperational: false
+                }
+            };
+        }
     }
 
     async getSystemReport() {
-        return await this.health.getSystemReport();
+        const baseReport = await this.health.getSystemReport();
+
+        // Wareneinlagerung-spezifische Berichtsdaten hinzufügen
+        try {
+            const [parallelStats, restartStats] = await Promise.all([
+                this.getParallelSessionStats(),
+                this.getSessionRestartStats(7)
+            ]);
+
+            const wareneinlagerungReport = {
+                mode: 'Wareneinlagerung (Multi-User)',
+                parallelSessionSupport: true,
+                sessionRestartSupport: true,
+                currentStats: parallelStats,
+                weeklyRestartStats: restartStats,
+                configuration: {
+                    multiSessionMode: this.multiSessionMode,
+                    allowSessionRestart: this.allowSessionRestart
+                }
+            };
+
+            return {
+                ...baseReport,
+                wareneinlagerung: wareneinlagerungReport
+            };
+        } catch (error) {
+            return {
+                ...baseReport,
+                wareneinlagerung: {
+                    error: `Wareneinlagerung-Bericht-Generierung fehlgeschlagen: ${error.message}`
+                }
+            };
+        }
     }
 
     // ===== UTILITY METHODS (DELEGATED) =====
@@ -413,7 +749,7 @@ class DatabaseClient {
     }
 
     /**
-     * Get comprehensive session report
+     * Get comprehensive session report (ERWEITERT FÜR WARENEINLAGERUNG)
      * @param {number} sessionId - Session ID
      * @returns {Object} - Comprehensive session report
      */
@@ -423,12 +759,14 @@ class DatabaseClient {
                 session,
                 scans,
                 duration,
-                stats
+                stats,
+                parallelStats
             ] = await Promise.all([
                 this.getSessionWithType(sessionId),
                 this.getQRScansBySession(sessionId),
                 this.getSessionDuration(sessionId),
-                this.getQRScanStats(sessionId)
+                this.getQRScanStats(sessionId),
+                this.getParallelSessionStats()
             ]);
 
             return {
@@ -436,21 +774,70 @@ class DatabaseClient {
                 scans,
                 duration,
                 stats,
+                parallelContext: parallelStats,
                 summary: {
                     sessionId: sessionId,
                     totalScans: scans.length,
                     validScans: scans.filter(s => s.Valid).length,
                     duration: duration,
-                    sessionType: session?.SessionTypeName,
+                    sessionType: session?.SessionTypeName || 'Wareneinlagerung',
                     user: session ? {
                         id: session.UserID,
                         name: session.UserName || 'Unknown'
-                    } : null
+                    } : null,
+                    parallelSessions: parallelStats.activeSessionCount,
+                    mode: 'Wareneinlagerung (Multi-User)'
                 },
                 generatedAt: new Date().toISOString()
             };
         } catch (error) {
             throw new Error(`Fehler beim Erstellen des Session-Reports: ${error.message}`);
+        }
+    }
+
+    /**
+     * WARENEINLAGERUNG-SPEZIFISCH: Multi-User Dashboard-Daten
+     * @returns {Object} - Dashboard-Daten für parallele Sessions
+     */
+    async getMultiUserDashboard() {
+        try {
+            const [
+                activeSessions,
+                parallelStats,
+                recentActivity,
+                topPerformers
+            ] = await Promise.all([
+                this.getActiveSessions(),
+                this.getParallelSessionStats(),
+                this.getRecentActivity(2), // Letzte 2 Stunden
+                this.getTopPerformers('scans', 5) // Top 5 Performer
+            ]);
+
+            return {
+                overview: {
+                    mode: 'Wareneinlagerung Multi-User',
+                    activeUsers: parallelStats.activeUserCount,
+                    activeSessions: parallelStats.activeSessionCount,
+                    totalActiveScans: parallelStats.totalActiveScans,
+                    avgSessionDuration: parallelStats.avgSessionDurationMinutes
+                },
+                activeSessions: activeSessions.map(session => ({
+                    sessionId: session.ID,
+                    userId: session.UserID,
+                    userName: session.UserName,
+                    department: session.Department,
+                    startTime: session.StartTime,
+                    scanCount: session.ScanCount,
+                    durationMinutes: Math.round((new Date() - new Date(session.StartTime)) / (1000 * 60))
+                })),
+                recentActivity: recentActivity,
+                topPerformers: topPerformers,
+                timestamp: new Date().toISOString()
+            };
+
+        } catch (error) {
+            console.error('Fehler beim Erstellen des Multi-User-Dashboards:', error);
+            throw error;
         }
     }
 }
@@ -463,8 +850,8 @@ module.exports = DatabaseClient;
 // Named Exports für erweiterte Nutzung
 module.exports.DatabaseClient = DatabaseClient;
 module.exports.SESSION_TYPES = SessionTypeConstants.SESSION_TYPES;
-module.exports.createWareneingangSession = SessionTypeConstants.createWareneingangSession;
-module.exports.getWareneingangSessionTypeId = SessionTypeConstants.getWareneingangSessionTypeId;
+module.exports.createWareneinlagerungSession = SessionTypeConstants.createWareneinlagerungSession;
+module.exports.getWareneinlagerungSessionTypeId = SessionTypeConstants.getWareneinlagerungSessionTypeId;
 
 // Module exports für direkte Nutzung (Advanced)
 module.exports.modules = {

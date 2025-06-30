@@ -1,7 +1,7 @@
 {
-  "name": "wareneingang-rfid-qr",
-  "version": "1.0.1",
-  "description": "RFID Login & QR Wareneingang System für Shirtful",
+  "name": "wareneinlagerung-rfid-qr",
+  "version": "1.0.0",
+  "description": "RFID Login & QR Wareneinlagerung System für Shirtful - Multi-User parallele Sessions",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -36,15 +36,21 @@
     "db:init": "node scripts/init-db.js",
     "db:migrate": "node scripts/migrate-db.js",
     "db:seed": "node scripts/seed-db.js",
-    "validate": "node scripts/validate-setup.js"
+    "validate": "node scripts/validate-setup.js",
+    "multi-user": "npm start -- --multi-user",
+    "single-user": "npm start -- --single-user"
   },
   "keywords": [
     "electron",
     "rfid",
     "qr-code",
     "warehouse",
+    "storage",
+    "wareneinlagerung",
     "scanner",
-    "mssql"
+    "mssql",
+    "multi-user",
+    "parallel-sessions"
   ],
   "author": "Shirtful Development Team",
   "license": "UNLICENSED",
@@ -75,9 +81,23 @@
     "node": ">=16.0.0",
     "npm": ">=8.0.0"
   },
+  "wareneinlagerung": {
+    "mode": "multi-user",
+    "features": {
+      "parallelSessions": true,
+      "sessionRestart": true,
+      "multiUserQRScanning": true,
+      "rfidSessionManagement": true
+    },
+    "limits": {
+      "maxParallelSessions": 15,
+      "maxUsersPerSession": 1,
+      "qrScanCooldown": 2000
+    }
+  },
   "build": {
-    "appId": "com.shirtful.wareneingang",
-    "productName": "Wareneingang RFID QR",
+    "appId": "com.shirtful.wareneinlagerung",
+    "productName": "Wareneinlagerung RFID QR",
     "directories": {
       "output": "dist"
     },
@@ -100,6 +120,13 @@
       "!**/{appveyor.yml,.travis.yml,circle.yml}",
       "!**/{npm-debug.log,yarn.lock,.yarn-integrity,.yarn-metadata.json}"
     ],
+    "extraMetadata": {
+      "wareneinlagerung": {
+        "version": "1.0.0",
+        "mode": "multi-user",
+        "description": "Wareneinlagerung mit parallelen Sessions"
+      }
+    },
     "win": {
       "target": "nsis",
       "icon": "assets/icon.ico"
@@ -111,7 +138,9 @@
       "uninstallerIcon": "assets/icon.ico",
       "installerHeaderIcon": "assets/icon.ico",
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "shortcutName": "Wareneinlagerung RFID QR",
+      "menuCategory": "Shirtful Tools"
     },
     "mac": {
       "category": "public.app-category.business",
@@ -121,6 +150,24 @@
       "target": "AppImage",
       "category": "Office",
       "icon": "assets/icon.png"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shirtful/wareneinlagerung-rfid-qr.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shirtful/wareneinlagerung-rfid-qr/issues"
+  },
+  "homepage": "https://github.com/shirtful/wareneinlagerung-rfid-qr#readme",
+  "config": {
+    "wareneinlagerung": {
+      "defaultMode": "multi-user",
+      "enableParallelSessions": true,
+      "enableSessionRestart": true,
+      "maxConcurrentUsers": 15,
+      "sessionTimeoutHours": 8,
+      "autoLogoutDisabled": true
     }
   }
 }

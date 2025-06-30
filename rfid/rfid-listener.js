@@ -15,7 +15,7 @@ class RFIDListener extends EventEmitter {
         this.lastInputTime = 0;
         this.HID = null;
 
-        console.log('RFID Listener initialized:', {
+        console.log('RFID Listener für Wareneinlagerung initialized:', {
             minScanInterval: this.minScanInterval,
             inputTimeout: this.inputTimeout,
             maxBufferLength: this.maxBufferLength
@@ -29,7 +29,7 @@ class RFIDListener extends EventEmitter {
         }
 
         try {
-            console.log('Starting RFID Listener...');
+            console.log('Starting RFID Listener für Wareneinlagerung...');
 
             // Try to load HID module with better error handling
             try {
@@ -69,7 +69,7 @@ class RFIDListener extends EventEmitter {
             this.isListening = true;
             this.emit('started');
 
-            console.log('✅ RFID Listener started successfully');
+            console.log('✅ RFID Listener für Wareneinlagerung started successfully');
             return true;
 
         } catch (error) {
@@ -383,7 +383,7 @@ class RFIDListener extends EventEmitter {
 
         this.lastScanTime = now;
 
-        console.log(`✅ RFID Tag detected: ${tagId}`);
+        console.log(`✅ RFID Tag detected für Wareneinlagerung: ${tagId}`);
 
         // Emit tag event
         this.emit('tag', tagId);
@@ -434,6 +434,7 @@ class RFIDListener extends EventEmitter {
             buffer: this.buffer,
             lastScanTime: this.lastScanTime,
             hidModuleLoaded: !!this.HID,
+            mode: 'wareneinlagerung', // Identifiziert den Modus
             config: {
                 minScanInterval: this.minScanInterval,
                 inputTimeout: this.inputTimeout,
@@ -459,7 +460,7 @@ class RFIDListener extends EventEmitter {
             return false;
         }
 
-        console.log(`🧪 Simulating RFID tag: ${tagId}`);
+        console.log(`🧪 Simulating RFID tag für Wareneinlagerung: ${tagId}`);
 
         this.emit('tag', tagId);
 
