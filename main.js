@@ -15,6 +15,9 @@ if (process.platform === 'win32') {
 // Nur sichere Module laden
 const DatabaseClient = require('./db/db-client');
 
+// SessionTypes Setup-Funktionen importieren
+const { setupSessionTypes } = require('./db/constants/session-types');
+
 // Simple RFID Listener laden (ohne native Dependencies)
 let SimpleRFIDListener;
 try {
@@ -35,6 +38,7 @@ class WareneinlagerungMainApp {
         this.systemStatus = {
             database: false,
             rfid: false,
+            sessionTypesSetup: false,
             lastError: null
         };
 
@@ -58,6 +62,9 @@ class WareneinlagerungMainApp {
         // RFID-Scan Tracking
         this.lastRFIDScanTime = 0;
         this.rfidScanCooldown = 2000; // 2 Sekunden zwischen RFID-Scans
+
+        // SessionType Fallback-Konfiguration
+        this.sessionTypePriority = ['Wareneinlagerung', 'Wareneingang'];
 
         this.initializeApp();
     }
@@ -200,16 +207,13 @@ class WareneinlagerungMainApp {
             this.dbClient = new DatabaseClient();
             await this.dbClient.connect();
 
-            // Health Check
-            const health = await this.dbClient.healthCheck();
-            if (!health.connected) {
-                throw new Error(health.error || 'Gesundheitsprüfung fehlgeschlagen');
-            }
-
             this.systemStatus.database = true;
             this.systemStatus.lastError = null;
 
             console.log('✅ Datenbank erfolgreich verbunden');
+
+            // **KRITISCH: SessionTypes Setup ausführen**
+            await this.setupSessionTypes();
 
             // QR-Code Dekodierung Statistiken laden
             await this.loadDecodingStats();
@@ -232,6 +236,72 @@ class WareneinlagerungMainApp {
                 );
             }
         }
+    }
+
+    /**
+     * NEUE FUNKTION: SessionTypes Setup ausführen
+     * Stellt sicher, dass alle SessionTypes in der Datenbank vorhanden sind
+     */
+    async setupSessionTypes() {
+        try {
+            console.log('🔧 Initialisiere SessionTypes...');
+
+            // SessionTypes Setup mit roher Datenbankverbindung ausführen
+            const success = await setupSessionTypes(this.dbClient);
+
+            if (success) {
+                this.systemStatus.sessionTypesSetup = true;
+                console.log('✅ SessionTypes erfolgreich initialisiert');
+
+                // Verfügbare SessionTypes anzeigen
+                const sessionTypes = await this.dbClient.getSessionTypes();
+                console.log(`📋 Verfügbare SessionTypes (${sessionTypes.length}):`);
+                sessionTypes.forEach(type => {
+                    console.log(`   - ${type.TypeName}: ${type.Description}`);
+                });
+
+                // SessionType-Priorität basierend auf verfügbaren Types aktualisieren
+                this.updateSessionTypePriority(sessionTypes);
+
+            } else {
+                this.systemStatus.sessionTypesSetup = false;
+                this.systemStatus.lastError = 'SessionTypes Setup fehlgeschlagen';
+                console.error('❌ SessionTypes Setup fehlgeschlagen');
+
+                // Weiter ausführen, aber mit Warnung
+                console.warn('⚠️ System läuft möglicherweise eingeschränkt ohne SessionTypes');
+            }
+
+        } catch (error) {
+            this.systemStatus.sessionTypesSetup = false;
+            this.systemStatus.lastError = `SessionTypes Setup: ${error.message}`;
+            console.error('❌ Fehler beim SessionTypes Setup:', error);
+
+            // Nicht kritisch genug um das System zu stoppen
+            console.warn('⚠️ System startet ohne SessionTypes Setup');
+        }
+    }
+
+    /**
+     * Aktualisiert die SessionType-Priorität basierend auf verfügbaren Types
+     * @param {Array} availableSessionTypes - Verfügbare SessionTypes aus der DB
+     */
+    updateSessionTypePriority(availableSessionTypes) {
+        const availableTypeNames = availableSessionTypes.map(type => type.TypeName);
+
+        // Filtere nur verfügbare SessionTypes und behalte die Prioritätsreihenfolge bei
+        this.sessionTypePriority = this.sessionTypePriority.filter(typeName =>
+            availableTypeNames.includes(typeName)
+        );
+
+        // Füge weitere verfügbare Types hinzu, falls sie nicht in der Prioritätsliste sind
+        availableTypeNames.forEach(typeName => {
+            if (!this.sessionTypePriority.includes(typeName)) {
+                this.sessionTypePriority.push(typeName);
+            }
+        });
+
+        console.log(`🔧 SessionType-Priorität aktualisiert: [${this.sessionTypePriority.join(', ')}]`);
     }
 
     async loadDecodingStats() {
@@ -289,6 +359,48 @@ class WareneinlagerungMainApp {
 
             // RFID ist nicht kritisch - App kann ohne laufen
         }
+    }
+
+    /**
+     * NEUE HILFSFUNKTION: Session mit Fallback erstellen
+     * Versucht verschiedene SessionTypes in Prioritätsreihenfolge
+     * @param {number} userId - Benutzer ID
+     * @param {Array} sessionTypePriority - Prioritätsliste der SessionTypes (optional)
+     * @returns {Object} - { session, sessionTypeName, fallbackUsed }
+     */
+    async createSessionWithFallback(userId, sessionTypePriority = null) {
+        const typesToTry = sessionTypePriority || this.sessionTypePriority;
+
+        if (typesToTry.length === 0) {
+            throw new Error('Keine SessionTypes verfügbar');
+        }
+
+        let lastError = null;
+
+        for (const sessionType of typesToTry) {
+            try {
+                console.log(`🔄 Versuche SessionType: ${sessionType}`);
+                const session = await this.dbClient.createSession(userId, sessionType);
+
+                if (session) {
+                    const fallbackUsed = sessionType !== typesToTry[0];
+                    console.log(`✅ Session erfolgreich erstellt mit SessionType: ${sessionType}${fallbackUsed ? ' (Fallback)' : ''}`);
+
+                    return {
+                        session,
+                        sessionTypeName: sessionType,
+                        fallbackUsed
+                    };
+                }
+            } catch (error) {
+                console.warn(`⚠️ SessionType '${sessionType}' nicht verfügbar: ${error.message}`);
+                lastError = error;
+                continue;
+            }
+        }
+
+        // Wenn alle SessionTypes fehlschlagen
+        throw new Error(`Alle SessionTypes fehlgeschlagen. Letzter Fehler: ${lastError?.message || 'Unbekannt'}`);
     }
 
     setupIPCHandlers() {
@@ -350,8 +462,8 @@ class WareneinlagerungMainApp {
                     throw new Error('Datenbank nicht verbunden');
                 }
 
-                // Neue Session erstellen (ohne bestehende zu beenden)
-                const session = await this.dbClient.createSession(userId, 'Wareneinlagerung');
+                // Session mit Fallback erstellen
+                const { session, sessionTypeName, fallbackUsed } = await this.createSessionWithFallback(userId);
 
                 if (session) {
                     // Lokale Session-Daten setzen/aktualisieren
@@ -359,7 +471,8 @@ class WareneinlagerungMainApp {
                         sessionId: session.ID,
                         userId: userId,
                         startTime: session.StartTS,
-                        lastActivity: new Date()
+                        lastActivity: new Date(),
+                        sessionType: sessionTypeName
                     });
 
                     // Session-Timer starten
@@ -371,14 +484,21 @@ class WareneinlagerungMainApp {
                     // Zeitstempel normalisieren für konsistente Übertragung
                     const normalizedSession = {
                         ...session,
-                        StartTS: this.normalizeTimestamp(session.StartTS)
+                        StartTS: this.normalizeTimestamp(session.StartTS),
+                        SessionTypeName: sessionTypeName,
+                        FallbackUsed: fallbackUsed
                     };
 
-                    console.log('Session erstellt für Wareneinlagerung:', normalizedSession);
+                    console.log(`Session erstellt für ${sessionTypeName}:`, normalizedSession);
+
+                    if (fallbackUsed) {
+                        console.warn(`⚠️ Fallback SessionType '${sessionTypeName}' verwendet`);
+                    }
+
                     return normalizedSession;
                 }
 
-                return session;
+                return null;
             } catch (error) {
                 console.error('Session Create Fehler:', error);
                 return null;
@@ -561,9 +681,11 @@ class WareneinlagerungMainApp {
             return {
                 database: this.systemStatus.database,
                 rfid: this.systemStatus.rfid,
+                sessionTypesSetup: this.systemStatus.sessionTypesSetup,
                 lastError: this.systemStatus.lastError,
                 activeSessions: Array.from(this.activeSessions.values()),
                 activeSessionCount: this.activeSessions.size,
+                sessionTypePriority: this.sessionTypePriority,
                 uptime: Math.floor(process.uptime()),
                 timestamp: new Date().toISOString(),
                 qrScanStats: this.getQRScanStats(),
@@ -584,6 +706,8 @@ class WareneinlagerungMainApp {
                     qrDecoding: true,
                     parallelSessions: true,
                     sessionRestart: true,
+                    sessionTypeFallback: true,
+                    sessionTypesSetup: this.systemStatus.sessionTypesSetup,
                     decodingFormats: ['caret_separated', 'pattern_matching', 'structured_data'],
                     supportedFields: ['auftrags_nr', 'paket_nr', 'kunden_name']
                 }
@@ -677,7 +801,7 @@ class WareneinlagerungMainApp {
         }
     }
 
-    // ===== VERBESSERTE RFID-VERARBEITUNG FÜR PARALLELE SESSIONS =====
+    // ===== VERBESSERTE RFID-VERARBEITUNG MIT FALLBACK =====
     async handleRFIDScan(tagId) {
         const now = Date.now();
 
@@ -718,7 +842,7 @@ class WareneinlagerungMainApp {
 
                 // Session in Datenbank neu starten
                 const restartSuccess = await this.dbClient.query(`
-                    UPDATE Sessions 
+                    UPDATE Sessions
                     SET StartTS = GETDATE()
                     WHERE ID = ? AND UserID = ? AND Active = 1
                 `, [existingSession.sessionId, user.ID]);
@@ -736,6 +860,7 @@ class WareneinlagerungMainApp {
                     this.sendToRenderer('session-restarted', {
                         user,
                         sessionId: existingSession.sessionId,
+                        sessionType: existingSession.sessionType || 'Unbekannt',
                         newStartTime: existingSession.startTime.toISOString(),
                         timestamp: new Date().toISOString(),
                         source: 'rfid_scan'
@@ -751,47 +876,68 @@ class WareneinlagerungMainApp {
                 }
 
             } else {
-                // ===== NEUE SESSION ERSTELLEN =====
+                // ===== NEUE SESSION ERSTELLEN MIT FALLBACK =====
                 console.log(`🔑 Neue Session für ${user.BenutzerName}...`);
 
-                const session = await this.dbClient.createSession(user.ID, 'Wareneinlagerung');
+                try {
+                    const { session, sessionTypeName, fallbackUsed } = await this.createSessionWithFallback(user.ID);
 
-                if (session) {
-                    // Lokale Session-Daten setzen
-                    this.activeSessions.set(user.ID, {
-                        sessionId: session.ID,
-                        userId: user.ID,
-                        startTime: session.StartTS,
-                        lastActivity: new Date()
-                    });
+                    if (session) {
+                        // Lokale Session-Daten setzen
+                        this.activeSessions.set(user.ID, {
+                            sessionId: session.ID,
+                            userId: user.ID,
+                            startTime: session.StartTS,
+                            lastActivity: new Date(),
+                            sessionType: sessionTypeName
+                        });
 
-                    // Session-Timer starten
-                    this.startSessionTimer(session.ID, user.ID);
+                        // Session-Timer starten
+                        this.startSessionTimer(session.ID, user.ID);
 
-                    // Rate Limit für neue Session initialisieren
-                    this.qrScanRateLimit.set(session.ID, []);
+                        // Rate Limit für neue Session initialisieren
+                        this.qrScanRateLimit.set(session.ID, []);
 
-                    // Session-Daten mit normalisiertem Zeitstempel senden
-                    const normalizedSession = {
-                        ...session,
-                        StartTS: this.normalizeTimestamp(session.StartTS)
-                    };
+                        // Session-Daten mit normalisiertem Zeitstempel senden
+                        const normalizedSession = {
+                            ...session,
+                            StartTS: this.normalizeTimestamp(session.StartTS)
+                        };
 
-                    // Login-Event senden
-                    this.sendToRenderer('user-login', {
-                        user,
-                        session: normalizedSession,
-                        timestamp: new Date().toISOString(),
-                        source: 'rfid_scan',
-                        isNewSession: true
-                    });
+                        // Login-Event senden
+                        this.sendToRenderer('user-login', {
+                            user,
+                            session: normalizedSession,
+                            sessionType: sessionTypeName,
+                            fallbackUsed: fallbackUsed,
+                            timestamp: new Date().toISOString(),
+                            source: 'rfid_scan',
+                            isNewSession: true
+                        });
 
-                    console.log(`✅ Neue Session erstellt für ${user.BenutzerName} (Session ${session.ID})`);
-                } else {
+                        console.log(`✅ Neue Session erstellt für ${user.BenutzerName} (Session ${session.ID}, Type: ${sessionTypeName})`);
+
+                        if (fallbackUsed) {
+                            console.warn(`⚠️ Fallback SessionType '${sessionTypeName}' verwendet - primärer SessionType nicht verfügbar`);
+
+                            // Warnung an Renderer senden
+                            this.sendToRenderer('session-fallback-warning', {
+                                user,
+                                sessionType: sessionTypeName,
+                                primaryType: this.sessionTypePriority[0],
+                                message: `Fallback SessionType '${sessionTypeName}' verwendet`,
+                                timestamp: new Date().toISOString()
+                            });
+                        }
+                    }
+                } catch (sessionError) {
+                    console.error(`❌ Konnte keine Session erstellen für ${user.BenutzerName}:`, sessionError.message);
+
                     this.sendToRenderer('rfid-scan-error', {
                         tagId,
-                        message: 'Fehler beim Erstellen der neuen Session',
-                        timestamp: new Date().toISOString()
+                        message: `Keine verfügbaren SessionTypes: ${sessionError.message}`,
+                        timestamp: new Date().toISOString(),
+                        critical: true
                     });
                 }
             }
@@ -944,6 +1090,8 @@ class WareneinlagerungMainApp {
         this.sendToRenderer('system-ready', {
             database: this.systemStatus.database,
             rfid: this.systemStatus.rfid,
+            sessionTypesSetup: this.systemStatus.sessionTypesSetup,
+            sessionTypePriority: this.sessionTypePriority,
             lastError: this.systemStatus.lastError,
             timestamp: new Date().toISOString(),
             decodingStats: this.decodingStats,

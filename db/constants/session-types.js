@@ -9,7 +9,8 @@
  * Standard SessionTypes für die Anwendung
  */
 const SESSION_TYPES = {
-    WARENEINGANG: 'Wareneingang',
+    WARENEINLAGERUNG: 'Wareneinlagerung',  // Hauptfunktion der Anwendung
+    WARENEINGANG: 'Wareneingang',          // Alternative/Legacy
     QUALITAETSKONTROLLE: 'Qualitätskontrolle',
     KOMMISSIONIERUNG: 'Kommissionierung',
     INVENTUR: 'Inventur',
@@ -20,15 +21,25 @@ const SESSION_TYPES = {
  * SessionType Konfigurationen mit Metadaten
  */
 const SESSION_TYPE_CONFIG = {
-    [SESSION_TYPES.WARENEINGANG]: {
-        id: SESSION_TYPES.WARENEINGANG,
-        name: 'Wareneingang',
-        description: 'Eingehende Waren scannen und verarbeiten',
+    [SESSION_TYPES.WARENEINLAGERUNG]: {
+        id: SESSION_TYPES.WARENEINLAGERUNG,
+        name: 'Wareneinlagerung',
+        description: 'Eingehende Waren scannen und einlagern - Hauptfunktion',
         icon: '📦',
         color: 'blue',
         defaultDuration: 480, // 8 Stunden in Minuten
         allowedQRTypes: ['decoded_qr', 'caret_separated', 'star_separated'],
         priority: 1
+    },
+    [SESSION_TYPES.WARENEINGANG]: {
+        id: SESSION_TYPES.WARENEINGANG,
+        name: 'Wareneingang',
+        description: 'Eingehende Waren scannen und verarbeiten - Legacy',
+        icon: '📥',
+        color: 'lightblue',
+        defaultDuration: 480, // 8 Stunden in Minuten
+        allowedQRTypes: ['decoded_qr', 'caret_separated', 'star_separated'],
+        priority: 2
     },
     [SESSION_TYPES.QUALITAETSKONTROLLE]: {
         id: SESSION_TYPES.QUALITAETSKONTROLLE,
@@ -38,7 +49,7 @@ const SESSION_TYPE_CONFIG = {
         color: 'orange',
         defaultDuration: 240, // 4 Stunden in Minuten
         allowedQRTypes: ['decoded_qr', 'barcode', 'alphanumeric'],
-        priority: 2
+        priority: 3
     },
     [SESSION_TYPES.KOMMISSIONIERUNG]: {
         id: SESSION_TYPES.KOMMISSIONIERUNG,
@@ -48,7 +59,7 @@ const SESSION_TYPE_CONFIG = {
         color: 'green',
         defaultDuration: 480, // 8 Stunden in Minuten
         allowedQRTypes: ['decoded_qr', 'caret_separated'],
-        priority: 3
+        priority: 4
     },
     [SESSION_TYPES.INVENTUR]: {
         id: SESSION_TYPES.INVENTUR,
@@ -58,7 +69,7 @@ const SESSION_TYPE_CONFIG = {
         color: 'purple',
         defaultDuration: 360, // 6 Stunden in Minuten
         allowedQRTypes: ['decoded_qr', 'barcode', 'alphanumeric'],
-        priority: 4
+        priority: 5
     },
     [SESSION_TYPES.WARTUNG]: {
         id: SESSION_TYPES.WARTUNG,
@@ -68,14 +79,47 @@ const SESSION_TYPE_CONFIG = {
         color: 'red',
         defaultDuration: 120, // 2 Stunden in Minuten
         allowedQRTypes: ['decoded_qr', 'text', 'url'],
-        priority: 5
+        priority: 6
     }
 };
 
 // ===== HELPER FUNCTIONS =====
 
 /**
- * Helper-Funktion zum Erstellen einer Wareneingang-Session
+ * Helper-Funktion zum Erstellen einer Wareneinlagerung-Session
+ * @param {Object} dbClient - Datenbankverbindung (muss sessions module haben)
+ * @param {number} userId - Benutzer-ID
+ * @returns {Object|null} - Neue Session oder null
+ */
+async function createWareneinlagerungSession(dbClient, userId) {
+    if (!dbClient.sessions) {
+        throw new Error('DatabaseClient muss sessions module haben');
+    }
+    return await dbClient.sessions.createSession(userId, SESSION_TYPES.WARENEINLAGERUNG);
+}
+
+/**
+ * Helper-Funktion zum Abrufen der SessionType-ID für Wareneinlagerung
+ * @param {Object} dbClient - Datenbankverbindung (muss sessions module haben)
+ * @returns {number|null} - SessionType ID oder null
+ */
+async function getWareneinlagerungSessionTypeId(dbClient) {
+    try {
+        if (!dbClient.sessions) {
+            throw new Error('DatabaseClient muss sessions module haben');
+        }
+
+        const types = await dbClient.sessions.getSessionTypes();
+        const wareneinlagerung = types.find(type => type.TypeName === SESSION_TYPES.WARENEINLAGERUNG);
+        return wareneinlagerung ? wareneinlagerung.ID : null;
+    } catch (error) {
+        console.error('Fehler beim Abrufen der Wareneinlagerung SessionType ID:', error);
+        return null;
+    }
+}
+
+/**
+ * Legacy: Helper-Funktion zum Erstellen einer Wareneingang-Session
  * @param {Object} dbClient - Datenbankverbindung (muss sessions module haben)
  * @param {number} userId - Benutzer-ID
  * @returns {Object|null} - Neue Session oder null
@@ -88,7 +132,7 @@ async function createWareneingangSession(dbClient, userId) {
 }
 
 /**
- * Helper-Funktion zum Abrufen der SessionType-ID für Wareneingang
+ * Legacy: Helper-Funktion zum Abrufen der SessionType-ID für Wareneingang
  * @param {Object} dbClient - Datenbankverbindung (muss sessions module haben)
  * @returns {number|null} - SessionType ID oder null
  */
@@ -155,55 +199,15 @@ function validateQRForSessionType(sessionTypeName, qrData) {
     const config = getSessionTypeConfig(sessionTypeName);
 
     if (!config) {
-        return { isValid: true }; // Unbekannte SessionTypes erlauben alles
+        return { isValid: true }; // Keine Konfiguration = alle QR-Codes erlaubt
     }
 
-    // QR-Type Validierung
+    // QR-Typ validieren falls vorhanden
     if (qrData.type && !config.allowedQRTypes.includes(qrData.type)) {
         return {
             isValid: false,
-            message: `QR-Code-Typ '${qrData.type}' ist für '${sessionTypeName}' nicht erlaubt`
+            message: `QR-Code-Typ '${qrData.type}' nicht erlaubt für ${sessionTypeName}`
         };
-    }
-
-    // Spezifische Validierung je SessionType
-    switch (sessionTypeName) {
-        case SESSION_TYPES.WARENEINGANG:
-            // Wareneingang benötigt strukturierte Daten
-            if (qrData.type === 'decoded_qr' && qrData.decoded) {
-                const hasStructuredData = qrData.decoded.auftrags_nr || qrData.decoded.paket_nr;
-                if (!hasStructuredData) {
-                    return {
-                        isValid: false,
-                        message: 'Wareneingang benötigt QR-Codes mit Auftrags- oder Paketnummer'
-                    };
-                }
-            }
-            break;
-
-        case SESSION_TYPES.QUALITAETSKONTROLLE:
-            // QK akzeptiert meist alle Codes
-            break;
-
-        case SESSION_TYPES.KOMMISSIONIERUNG:
-            // Kommissionierung benötigt Auftragsdaten
-            if (qrData.type === 'decoded_qr' && qrData.decoded) {
-                if (!qrData.decoded.auftrags_nr) {
-                    return {
-                        isValid: false,
-                        message: 'Kommissionierung benötigt QR-Codes mit Auftragsnummer'
-                    };
-                }
-            }
-            break;
-
-        case SESSION_TYPES.INVENTUR:
-            // Inventur akzeptiert strukturierte Codes
-            break;
-
-        case SESSION_TYPES.WARTUNG:
-            // Wartung akzeptiert alle Codes
-            break;
     }
 
     return { isValid: true };
@@ -212,7 +216,7 @@ function validateQRForSessionType(sessionTypeName, qrData) {
 /**
  * SessionType-Icon für UI abrufen
  * @param {string} sessionTypeName - Name des SessionTypes
- * @returns {string} - Icon Emoji
+ * @returns {string} - Icon
  */
 function getSessionTypeIcon(sessionTypeName) {
     const config = getSessionTypeConfig(sessionTypeName);
@@ -287,20 +291,50 @@ async function createSessionTypesTable(dbConnection) {
  */
 async function insertDefaultSessionTypes(dbConnection) {
     try {
-        for (const config of getAllSessionTypeConfigs()) {
+        // WICHTIG: Definiere die SessionTypes explizit in der richtigen Reihenfolge
+        const sessionTypesToInsert = [
+            {
+                name: 'Wareneinlagerung',
+                description: 'Eingehende Waren scannen und einlagern - Hauptfunktion'
+            },
+            {
+                name: 'Wareneingang',
+                description: 'Eingehende Waren scannen und verarbeiten - Legacy'
+            },
+            {
+                name: 'Qualitätskontrolle',
+                description: 'Qualitätsprüfung von Waren und Produkten'
+            },
+            {
+                name: 'Kommissionierung',
+                description: 'Zusammenstellung von Bestellungen'
+            },
+            {
+                name: 'Inventur',
+                description: 'Bestandserfassung und Inventur'
+            },
+            {
+                name: 'Wartung',
+                description: 'Wartung und Instandhaltung'
+            }
+        ];
+
+        for (const sessionType of sessionTypesToInsert) {
             // Prüfe ob SessionType bereits existiert
             const existingResult = await dbConnection.query(`
                 SELECT COUNT(*) as count FROM dbo.SessionTypes WHERE TypeName = ?
-            `, [config.name]);
+            `, [sessionType.name]);
 
             if (existingResult.recordset[0].count === 0) {
                 // SessionType einfügen
                 await dbConnection.query(`
                     INSERT INTO dbo.SessionTypes (TypeName, Description, IsActive)
                     VALUES (?, ?, 1)
-                `, [config.name, config.description]);
+                `, [sessionType.name, sessionType.description]);
 
-                console.log(`[INFO] SessionType '${config.name}' eingefügt`);
+                console.log(`[INFO] SessionType '${sessionType.name}' eingefügt`);
+            } else {
+                console.log(`[INFO] SessionType '${sessionType.name}' bereits vorhanden`);
             }
         }
 
@@ -318,7 +352,7 @@ async function insertDefaultSessionTypes(dbConnection) {
  */
 async function setupSessionTypes(dbConnection) {
     try {
-        console.log('[INFO] Setup der SessionTypes wird gestartet...');
+        console.log('[INFO] 🔧 Setup der SessionTypes wird gestartet...');
 
         const tableCreated = await createSessionTypesTable(dbConnection);
         if (!tableCreated) {
@@ -330,7 +364,29 @@ async function setupSessionTypes(dbConnection) {
             return false;
         }
 
-        console.log('[SUCCESS] SessionTypes Setup erfolgreich abgeschlossen');
+        // Verify that Wareneinlagerung was inserted
+        try {
+            const verifyResult = await dbConnection.query(`
+                SELECT COUNT(*) as count FROM dbo.SessionTypes 
+                WHERE TypeName = 'Wareneinlagerung' AND IsActive = 1
+            `);
+
+            if (verifyResult.recordset[0].count === 0) {
+                console.log('[WARN] ⚠️ Wareneinlagerung SessionType nicht gefunden - füge direkt hinzu...');
+
+                // Direkt einfügen als Fallback
+                await dbConnection.query(`
+                    INSERT INTO dbo.SessionTypes (TypeName, Description, IsActive)
+                    VALUES ('Wareneinlagerung', 'Eingehende Waren scannen und einlagern - Hauptfunktion', 1)
+                `);
+
+                console.log('[SUCCESS] ✅ Wareneinlagerung SessionType direkt eingefügt');
+            }
+        } catch (verifyError) {
+            console.error('[ERROR] Fehler beim Verifizieren von Wareneinlagerung SessionType:', verifyError);
+        }
+
+        console.log('[SUCCESS] ✅ SessionTypes Setup erfolgreich abgeschlossen');
         return true;
     } catch (error) {
         console.error('[ERROR] Fehler beim SessionTypes Setup:', error);
@@ -344,9 +400,15 @@ module.exports = {
     SESSION_TYPES,
     SESSION_TYPE_CONFIG,
 
-    // Helper Functions
+    // Helper Functions (Primary)
+    createWareneinlagerungSession,
+    getWareneinlagerungSessionTypeId,
+
+    // Helper Functions (Legacy)
     createWareneingangSession,
     getWareneingangSessionTypeId,
+
+    // General Helper Functions
     getSessionTypeConfig,
     getAllSessionTypeConfigs,
     isQRTypeAllowedForSession,

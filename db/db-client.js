@@ -2,6 +2,7 @@
  * Modular Database Client für Wareneinlagerung
  * Composition of specialized database modules for better maintainability
  * Angepasst für parallele Sessions und RFID-Session-Restart-Logik
+ * VOLLSTÄNDIG KORRIGIERT für SessionTypes Setup und Wareneinlagerung
  *
  * This version supports multiple parallel sessions and RFID session restart functionality.
  */
@@ -25,6 +26,7 @@ const SessionTypeConstants = require('./constants/session-types');
  *
  * Supports multiple parallel sessions and RFID session restart functionality
  * while providing better code organization through specialized modules.
+ * KORRIGIERT für automatisches SessionTypes Setup
  */
 class DatabaseClient {
     constructor() {
@@ -32,16 +34,17 @@ class DatabaseClient {
         this.connection = new DatabaseConnection();
         this.utils = new DatabaseUtils();
 
-        // ===== SPECIALIZED MODULES =====
-        this.users = new UserModule(this.connection, this.utils);
-        this.sessions = new SessionModule(this.connection, this.utils);
-        this.qrscans = new QRScanModule(this.connection, this.utils);
-        this.stats = new StatsModule(this.connection, this.utils);
-        this.health = new HealthModule(this.connection, this.utils);
+        // ===== SPECIALIZED MODULES (werden nach connect() initialisiert) =====
+        this.users = null;
+        this.sessions = null;
+        this.qrscans = null;
+        this.stats = null;
+        this.health = null;
 
         // ===== WARENEINLAGERUNG-SPEZIFISCHE KONFIGURATION =====
         this.multiSessionMode = true; // Aktiviert parallele Sessions
         this.allowSessionRestart = true; // Erlaubt RFID-Session-Restart
+        this.sessionTypesInitialized = false; // Tracking für SessionTypes Setup
 
         // ===== BACKWARDS COMPATIBILITY PROPERTIES =====
         // Expose connection properties for compatibility
@@ -70,7 +73,55 @@ class DatabaseClient {
     // ===== CORE CONNECTION METHODS (DELEGATED) =====
 
     async connect() {
-        return await this.connection.connect();
+        const connectionResult = await this.connection.connect();
+
+        if (connectionResult) {
+            // Module nach erfolgreicher Verbindung initialisieren
+            this.users = new UserModule(this.connection, this.utils);
+            this.sessions = new SessionModule(this.connection, this.utils);
+            this.qrscans = new QRScanModule(this.connection, this.utils);
+            this.stats = new StatsModule(this.connection, this.utils);
+            this.health = new HealthModule(this.connection, this.utils);
+
+            console.log('✅ DatabaseClient Module initialisiert');
+
+            // SessionTypes automatisch initialisieren
+            await this.initializeSessionTypes();
+        }
+
+        return connectionResult;
+    }
+
+    /**
+     * NEUE METHODE: SessionTypes automatisch initialisieren
+     * Wird automatisch beim connect() aufgerufen
+     */
+    async initializeSessionTypes() {
+        try {
+            console.log('🔧 Initialisiere SessionTypes...');
+
+            const success = await SessionTypeConstants.setupSessionTypes(this.connection);
+
+            if (success) {
+                this.sessionTypesInitialized = true;
+                console.log('✅ SessionTypes erfolgreich initialisiert');
+
+                // Verfügbare SessionTypes loggen
+                const types = await this.getSessionTypes();
+                console.log(`📋 Verfügbare SessionTypes (${types.length}):`);
+                types.forEach(type => {
+                    console.log(`   - ${type.TypeName}: ${type.Description}`);
+                });
+            } else {
+                this.sessionTypesInitialized = false;
+                console.warn('⚠️ SessionTypes Setup fehlgeschlagen - System läuft eingeschränkt');
+            }
+
+        } catch (error) {
+            this.sessionTypesInitialized = false;
+            console.error('❌ Fehler beim SessionTypes Setup:', error);
+            console.warn('⚠️ System startet ohne vollständige SessionTypes');
+        }
     }
 
     async close() {
@@ -96,30 +147,37 @@ class DatabaseClient {
     // ===== USER OPERATIONS (DELEGATED) =====
 
     async getUserByEPC(epcHex) {
+        if (!this.users) throw new Error('DatabaseClient nicht verbunden');
         return await this.users.getUserByEPC(epcHex);
     }
 
     async getUserById(userId) {
+        if (!this.users) throw new Error('DatabaseClient nicht verbunden');
         return await this.users.getUserById(userId);
     }
 
     async getAllActiveUsers() {
+        if (!this.users) throw new Error('DatabaseClient nicht verbunden');
         return await this.users.getAllActiveUsers();
     }
 
     async searchUsers(searchTerm) {
+        if (!this.users) throw new Error('DatabaseClient nicht verbunden');
         return await this.users.searchUsers(searchTerm);
     }
 
     async getUserStats(userId) {
+        if (!this.users) throw new Error('DatabaseClient nicht verbunden');
         return await this.users.getUserStats(userId);
     }
 
     async validateUser(userId) {
+        if (!this.users) throw new Error('DatabaseClient nicht verbunden');
         return await this.users.validateUser(userId);
     }
 
     async getUserActivity(userId, limit = 50) {
+        if (!this.users) throw new Error('DatabaseClient nicht verbunden');
         return await this.users.getUserActivity(userId, limit);
     }
 
@@ -132,6 +190,18 @@ class DatabaseClient {
      * @returns {Object} - Session-Daten
      */
     async createSession(userId, sessionType = 'Wareneinlagerung') {
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
+
+        // Prüfe ob SessionTypes initialisiert sind
+        if (!this.sessionTypesInitialized) {
+            console.warn('⚠️ SessionTypes nicht initialisiert - versuche erneut...');
+            await this.initializeSessionTypes();
+
+            if (!this.sessionTypesInitialized) {
+                throw new Error('SessionTypes nicht verfügbar - kann keine Session erstellen');
+            }
+        }
+
         return await this.sessions.createSession(userId, sessionType);
     }
 
@@ -139,31 +209,40 @@ class DatabaseClient {
      * WARENEINLAGERUNG-SPEZIFISCH: Session für Benutzer neu starten
      * Setzt die StartTime auf aktuelle Zeit zurück, ohne die Session zu beenden
      * @param {number} sessionId - Session ID
+     * @param {number} userId - Benutzer ID (für Validierung)
      * @returns {Object} - Aktualisierte Session-Daten
      */
-    async restartSession(sessionId) {
+    async restartSession(sessionId, userId = null) {
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
+
         try {
-            const result = await this.query(`
-                UPDATE Sessions 
-                SET StartTime = GETDATE()
-                OUTPUT INSERTED.ID, INSERTED.UserID, INSERTED.StartTime, INSERTED.Active
-                WHERE ID = ? AND Active = 1
-            `, [sessionId]);
+            if (userId) {
+                // Mit Benutzer-Validierung
+                return await this.sessions.restartSession(sessionId, userId);
+            } else {
+                // Ohne Benutzer-Validierung (legacy support)
+                const result = await this.query(`
+                    UPDATE Sessions 
+                    SET StartTS = GETDATE()
+                    OUTPUT INSERTED.ID, INSERTED.UserID, INSERTED.StartTS, INSERTED.Active
+                    WHERE ID = ? AND Active = 1
+                `, [sessionId]);
 
-            if (result.recordset.length === 0) {
-                throw new Error(`Session ${sessionId} nicht gefunden oder nicht aktiv`);
+                if (result.recordset.length === 0) {
+                    throw new Error(`Session ${sessionId} nicht gefunden oder nicht aktiv`);
+                }
+
+                const updatedSession = result.recordset[0];
+                console.log(`✅ Session ${sessionId} neu gestartet`);
+
+                return {
+                    ID: updatedSession.ID,
+                    UserID: updatedSession.UserID,
+                    StartTS: this.utils.normalizeTimestamp(updatedSession.StartTS),
+                    Active: updatedSession.Active,
+                    restarted: true
+                };
             }
-
-            const updatedSession = result.recordset[0];
-            console.log(`✅ Session ${sessionId} neu gestartet für Benutzer ${updatedSession.UserID}`);
-
-            return {
-                ID: updatedSession.ID,
-                UserID: updatedSession.UserID,
-                StartTS: this.utils.normalizeTimestamp(updatedSession.StartTime),
-                Active: updatedSession.Active,
-                restarted: true
-            };
 
         } catch (error) {
             console.error('Fehler beim Neustarten der Session:', error);
@@ -177,33 +256,8 @@ class DatabaseClient {
      * @returns {Object|null} - Aktive Session oder null
      */
     async getActiveSessionByUserId(userId) {
-        try {
-            const result = await this.query(`
-                SELECT s.ID, s.UserID, s.StartTime, s.EndTime, s.Active,
-                       u.BenutzerName as UserName
-                FROM Sessions s
-                INNER JOIN ScannBenutzer u ON s.UserID = u.ID
-                WHERE s.UserID = ? AND s.Active = 1
-            `, [userId]);
-
-            if (result.recordset.length === 0) {
-                return null;
-            }
-
-            const session = result.recordset[0];
-            return {
-                ID: session.ID,
-                UserID: session.UserID,
-                UserName: session.UserName,
-                StartTime: this.utils.normalizeTimestamp(session.StartTime),
-                EndTime: session.EndTime ? this.utils.normalizeTimestamp(session.EndTime) : null,
-                Active: session.Active
-            };
-
-        } catch (error) {
-            console.error('Fehler beim Abrufen der aktiven Session:', error);
-            throw error;
-        }
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
+        return await this.sessions.getActiveSessionByUserId(userId);
     }
 
     /**
@@ -213,15 +267,15 @@ class DatabaseClient {
     async getActiveSessions() {
         try {
             const result = await this.query(`
-                SELECT s.ID, s.UserID, s.StartTime, s.EndTime, s.Active,
+                SELECT s.ID, s.UserID, s.StartTS, s.EndTS, s.Active,
                        u.BenutzerName as UserName, u.Department,
                        COUNT(qr.ID) as ScanCount
                 FROM Sessions s
-                INNER JOIN ScannBenutzer u ON s.UserID = u.ID
-                LEFT JOIN QrScans qr ON s.ID = qr.SessionID
+                         INNER JOIN ScannBenutzer u ON s.UserID = u.ID
+                         LEFT JOIN QrScans qr ON s.ID = qr.SessionID
                 WHERE s.Active = 1
-                GROUP BY s.ID, s.UserID, s.StartTime, s.EndTime, s.Active, u.BenutzerName, u.Department
-                ORDER BY s.StartTime ASC
+                GROUP BY s.ID, s.UserID, s.StartTS, s.EndTS, s.Active, u.BenutzerName, u.Department
+                ORDER BY s.StartTS ASC
             `);
 
             return result.recordset.map(session => ({
@@ -229,8 +283,8 @@ class DatabaseClient {
                 UserID: session.UserID,
                 UserName: session.UserName,
                 Department: session.Department,
-                StartTime: this.utils.normalizeTimestamp(session.StartTime),
-                EndTime: session.EndTime ? this.utils.normalizeTimestamp(session.EndTime) : null,
+                StartTS: this.utils.normalizeTimestamp(session.StartTS),
+                EndTS: session.EndTS ? this.utils.normalizeTimestamp(session.EndTS) : null,
                 Active: session.Active,
                 ScanCount: session.ScanCount || 0
             }));
@@ -242,14 +296,17 @@ class DatabaseClient {
     }
 
     async getSessionWithType(sessionId) {
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
         return await this.sessions.getSessionWithType(sessionId);
     }
 
     async getActiveSessionsWithType() {
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
         return await this.sessions.getActiveSessionsWithType();
     }
 
     async endSession(sessionId) {
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
         return await this.sessions.endSession(sessionId);
     }
 
@@ -262,143 +319,126 @@ class DatabaseClient {
         console.warn('⚠️ WARNUNG: endAllActiveSessions() aufgerufen in Wareneinlagerung-Modus!');
         console.warn('⚠️ Dies sollte nur in Notfällen verwendet werden, da Wareneinlagerung parallele Sessions unterstützt.');
 
-        try {
-            // Zuerst alle aktiven Sessions abrufen für Logging
-            const activeSessions = await this.getActiveSessions();
-
-            if (activeSessions.length === 0) {
-                return {
-                    success: true,
-                    endedCount: 0,
-                    endedUsers: [],
-                    message: 'Keine aktiven Sessions gefunden'
-                };
-            }
-
-            // Alle aktiven Sessions beenden
-            const result = await this.query(`
-                UPDATE Sessions
-                SET EndTime = GETDATE(), Active = 0
-                OUTPUT INSERTED.ID, INSERTED.UserID
-                WHERE Active = 1
-            `);
-
-            const endedUsers = activeSessions.map(session => ({
-                sessionId: session.ID,
-                userId: session.UserID,
-                userName: session.UserName
-            }));
-
-            console.log(`🚨 NOTFALL: ${result.recordset.length} aktive Sessions in Wareneinlagerung beendet`);
-
-            return {
-                success: true,
-                endedCount: result.recordset.length,
-                endedUsers: endedUsers,
-                message: `${result.recordset.length} Sessions in Notfall beendet`
-            };
-
-        } catch (error) {
-            console.error('Fehler beim Beenden aller aktiven Sessions:', error);
-            return {
-                success: false,
-                endedCount: 0,
-                endedUsers: [],
-                error: error.message
-            };
-        }
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
+        return await this.sessions.endAllActiveSessions();
     }
 
     async getActiveSession(userId) {
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
         return await this.sessions.getActiveSession(userId);
     }
 
     async getSessionDuration(sessionId) {
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
         return await this.sessions.getSessionDuration(sessionId);
     }
 
     async getSessionTypes() {
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
         return await this.sessions.getSessionTypes();
     }
 
     async getSessionTypeStats(startDate = null, endDate = null) {
+        if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
         return await this.sessions.getSessionTypeStats(startDate, endDate);
     }
 
     // ===== QR-SCAN OPERATIONS (DELEGATED) =====
 
     async saveQRScan(sessionId, payload) {
+        if (!this.qrscans) throw new Error('DatabaseClient nicht verbunden');
         return await this.qrscans.saveQRScan(sessionId, payload);
     }
 
     async getQRScansBySession(sessionId, limit = 50) {
+        if (!this.qrscans) throw new Error('DatabaseClient nicht verbunden');
         return await this.qrscans.getQRScansBySession(sessionId, limit);
     }
 
     async getQRScanById(scanId) {
+        if (!this.qrscans) throw new Error('DatabaseClient nicht verbunden');
         return await this.qrscans.getQRScanById(scanId);
     }
 
     async getRecentQRScans(limit = 20) {
+        if (!this.qrscans) throw new Error('DatabaseClient nicht verbunden');
         return await this.qrscans.getRecentQRScans(limit);
     }
 
     async getQrScansWithSessionType(sessionId = null, sessionTypeName = null) {
+        if (!this.qrscans) throw new Error('DatabaseClient nicht verbunden');
         return await this.qrscans.getQrScansWithSessionType(sessionId, sessionTypeName);
     }
 
     async getQRScanStats(sessionId = null) {
+        if (!this.qrscans) throw new Error('DatabaseClient nicht verbunden');
         return await this.qrscans.getQRScanStats(sessionId);
     }
 
     async searchQRScans(searchTerm, sessionId = null, limit = 20) {
+        if (!this.qrscans) throw new Error('DatabaseClient nicht verbunden');
         return await this.qrscans.searchQRScans(searchTerm, sessionId, limit);
     }
 
     async checkQRDuplicate(payload, timeWindowHours = 0.17) {
+        if (!this.qrscans) throw new Error('DatabaseClient nicht verbunden');
         return await this.qrscans.checkQRDuplicate(payload, timeWindowHours);
     }
 
     async checkForDuplicates(rawPayload, sessionId, minutesBack = 10) {
+        if (!this.qrscans) throw new Error('DatabaseClient nicht verbunden');
         return await this.qrscans.checkForDuplicates(rawPayload, sessionId, minutesBack);
     }
 
     // Alias for backwards compatibility
     async getSessionScans(sessionId, limit = 50) {
-        return await this.qrscans.getSessionScans(sessionId, limit);
+        return await this.getQRScansBySession(sessionId, limit);
+    }
+
+    // Legacy alias
+    async getQRScansForSession(sessionId, limit = 50) {
+        return await this.getQRScansBySession(sessionId, limit);
     }
 
     // ===== STATISTICS OPERATIONS (DELEGATED) =====
 
     async getDailyStats(date = null) {
+        if (!this.stats) throw new Error('DatabaseClient nicht verbunden');
         return await this.stats.getDailyStats(date);
     }
 
     async getRecentActivity(hours = 8) {
+        if (!this.stats) throw new Error('DatabaseClient nicht verbunden');
         return await this.stats.getRecentActivity(hours);
     }
 
     async getUserStatsDetailed(userId = null, startDate = null, endDate = null) {
+        if (!this.stats) throw new Error('DatabaseClient nicht verbunden');
         return await this.stats.getUserStats(userId, startDate, endDate);
     }
 
     async getHourlyActivity(date = null) {
+        if (!this.stats) throw new Error('DatabaseClient nicht verbunden');
         return await this.stats.getHourlyActivity(date);
     }
 
     async getWeeklyTrends(weeks = 4) {
+        if (!this.stats) throw new Error('DatabaseClient nicht verbunden');
         return await this.stats.getWeeklyTrends(weeks);
     }
 
     async getPerformanceMetrics(startDate = null, endDate = null) {
+        if (!this.stats) throw new Error('DatabaseClient nicht verbunden');
         return await this.stats.getPerformanceMetrics(startDate, endDate);
     }
 
     async getTopPerformers(metric = 'scans', limit = 10, startDate = null, endDate = null) {
+        if (!this.stats) throw new Error('DatabaseClient nicht verbunden');
         return await this.stats.getTopPerformers(metric, limit, startDate, endDate);
     }
 
     async getDashboardData(timeframe = 'today') {
+        if (!this.stats) throw new Error('DatabaseClient nicht verbunden');
         return await this.stats.getDashboardData(timeframe);
     }
 
@@ -411,16 +451,16 @@ class DatabaseClient {
     async getParallelSessionStats() {
         try {
             const result = await this.query(`
-                SELECT 
+                SELECT
                     COUNT(*) as ActiveSessionCount,
                     COUNT(DISTINCT UserID) as ActiveUserCount,
-                    AVG(DATEDIFF(MINUTE, StartTime, GETDATE())) as AvgSessionDurationMinutes,
+                    AVG(DATEDIFF(MINUTE, StartTS, GETDATE())) as AvgSessionDurationMinutes,
                     SUM(qr.ScanCount) as TotalActiveScans
                 FROM Sessions s
-                LEFT JOIN (
+                         LEFT JOIN (
                     SELECT SessionID, COUNT(*) as ScanCount
                     FROM QrScans
-                    WHERE ScanTime >= DATEADD(DAY, -1, GETDATE())
+                    WHERE CapturedTS >= DATEADD(DAY, -1, GETDATE())
                     GROUP BY SessionID
                 ) qr ON s.ID = qr.SessionID
                 WHERE s.Active = 1
@@ -459,19 +499,19 @@ class DatabaseClient {
             // basierend auf Sessions mit sehr kurzer Dauer gefolgt von neuen Sessions
             const result = await this.query(`
                 WITH SessionDurations AS (
-                    SELECT 
+                    SELECT
                         UserID,
-                        StartTime,
-                        LEAD(StartTime) OVER (PARTITION BY UserID ORDER BY StartTime) as NextStartTime,
-                        DATEDIFF(MINUTE, StartTime, ISNULL(EndTime, GETDATE())) as DurationMinutes
+                        StartTS,
+                        LEAD(StartTS) OVER (PARTITION BY UserID ORDER BY StartTS) as NextStartTime,
+                        DATEDIFF(MINUTE, StartTS, ISNULL(EndTS, GETDATE())) as DurationMinutes
                     FROM Sessions
-                    WHERE StartTime >= DATEADD(DAY, -?, GETDATE())
+                    WHERE StartTS >= DATEADD(DAY, -?, GETDATE())
                 )
-                SELECT 
+                SELECT
                     COUNT(*) as TotalSessions,
-                    COUNT(CASE WHEN DurationMinutes < 2 AND NextStartTime IS NOT NULL 
-                               AND DATEDIFF(MINUTE, StartTime, NextStartTime) < 5 
-                               THEN 1 END) as EstimatedRestarts,
+                    COUNT(CASE WHEN DurationMinutes < 2 AND NextStartTime IS NOT NULL
+                        AND DATEDIFF(MINUTE, StartTS, NextStartTime) < 5
+                                   THEN 1 END) as EstimatedRestarts,
                     AVG(DurationMinutes) as AvgSessionDuration,
                     COUNT(DISTINCT UserID) as UsersWithSessions
                 FROM SessionDurations
@@ -507,24 +547,72 @@ class DatabaseClient {
     // ===== HEALTH & DIAGNOSTICS (DELEGATED) =====
 
     async healthCheck() {
-        return await this.health.healthCheck();
+        try {
+            // Basis-Verbindungstest
+            const connectionTest = await this.query('SELECT 1 as test, SYSDATETIME() as currentTime');
+
+            // Tabellen-Validierung
+            const tablesValid = await this.validateTables();
+
+            // SessionTypes verfügbar?
+            const sessionTypes = await this.getSessionTypes();
+
+            // Aktive Sessions zählen
+            const activeSessions = await this.getActiveSessions();
+
+            return {
+                connection: connectionTest.recordset.length > 0,
+                tables: tablesValid,
+                sessionTypes: sessionTypes.length > 0,
+                sessionTypesInitialized: this.sessionTypesInitialized,
+                activeSessionsCount: activeSessions.length,
+                multiSessionMode: this.multiSessionMode,
+                allowSessionRestart: this.allowSessionRestart,
+                currentTime: connectionTest.recordset[0]?.currentTime,
+                status: 'healthy'
+            };
+
+        } catch (error) {
+            return {
+                connection: false,
+                tables: false,
+                sessionTypes: false,
+                sessionTypesInitialized: false,
+                activeSessionsCount: 0,
+                multiSessionMode: this.multiSessionMode,
+                allowSessionRestart: this.allowSessionRestart,
+                error: error.message,
+                status: 'unhealthy'
+            };
+        }
     }
 
     async testConnection() {
+        if (!this.health) throw new Error('DatabaseClient nicht verbunden');
         return await this.health.testConnection();
     }
 
     getConnectionStatus() {
+        if (!this.health) {
+            return {
+                connected: false,
+                message: 'DatabaseClient nicht verbunden'
+            };
+        }
         return this.health.getConnectionStatus();
     }
 
     async debugInfo() {
-        const baseInfo = await this.health.debugInfo();
+        const baseInfo = this.health ? await this.health.debugInfo() : {
+            connection: 'nicht verfügbar',
+            modules: 'nicht initialisiert'
+        };
 
         // Wareneinlagerung-spezifische Debug-Informationen hinzufügen
         const wareneinlagerungInfo = {
             multiSessionMode: this.multiSessionMode,
             allowSessionRestart: this.allowSessionRestart,
+            sessionTypesInitialized: this.sessionTypesInitialized,
             parallelSessionStats: await this.getParallelSessionStats(),
             sessionRestartStats: await this.getSessionRestartStats(1) // Letzte 24h
         };
@@ -536,19 +624,25 @@ class DatabaseClient {
     }
 
     async getPerformanceStats() {
+        if (!this.health) throw new Error('DatabaseClient nicht verbunden');
         return await this.health.getPerformanceStats();
     }
 
     async getDatabaseSize() {
+        if (!this.health) throw new Error('DatabaseClient nicht verbunden');
         return await this.health.getDatabaseSize();
     }
 
     async getTableSizes() {
+        if (!this.health) throw new Error('DatabaseClient nicht verbunden');
         return await this.health.getTableSizes();
     }
 
     async checkSystemHealth() {
-        const baseHealth = await this.health.checkSystemHealth();
+        const baseHealth = this.health ? await this.health.checkSystemHealth() : {
+            database: false,
+            performance: 'unknown'
+        };
 
         // Wareneinlagerung-spezifische Gesundheitsprüfungen
         try {
@@ -557,6 +651,7 @@ class DatabaseClient {
                 parallelSessionsOperational: parallelStats.activeSessionCount >= 0,
                 multiUserMode: this.multiSessionMode,
                 sessionRestartEnabled: this.allowSessionRestart,
+                sessionTypesReady: this.sessionTypesInitialized,
                 recommendedMaxParallelSessions: 10,
                 currentParallelSessions: parallelStats.activeSessionCount,
                 parallelSessionWarning: parallelStats.activeSessionCount > 15
@@ -571,14 +666,18 @@ class DatabaseClient {
                 ...baseHealth,
                 wareneinlagerung: {
                     error: `Wareneinlagerung-Gesundheitsprüfung fehlgeschlagen: ${error.message}`,
-                    parallelSessionsOperational: false
+                    parallelSessionsOperational: false,
+                    sessionTypesReady: false
                 }
             };
         }
     }
 
     async getSystemReport() {
-        const baseReport = await this.health.getSystemReport();
+        const baseReport = this.health ? await this.health.getSystemReport() : {
+            database: 'nicht verfügbar',
+            performance: 'unbekannt'
+        };
 
         // Wareneinlagerung-spezifische Berichtsdaten hinzufügen
         try {
@@ -591,6 +690,7 @@ class DatabaseClient {
                 mode: 'Wareneinlagerung (Multi-User)',
                 parallelSessionSupport: true,
                 sessionRestartSupport: true,
+                sessionTypesInitialized: this.sessionTypesInitialized,
                 currentStats: parallelStats,
                 weeklyRestartStats: restartStats,
                 configuration: {
@@ -682,7 +782,11 @@ class DatabaseClient {
      * @returns {boolean} - Success
      */
     async setupSessionTypes() {
-        return await SessionTypeConstants.setupSessionTypes(this.connection);
+        const success = await SessionTypeConstants.setupSessionTypes(this.connection);
+        if (success) {
+            this.sessionTypesInitialized = true;
+        }
+        return success;
     }
 
     /**
@@ -819,16 +923,17 @@ class DatabaseClient {
                     activeUsers: parallelStats.activeUserCount,
                     activeSessions: parallelStats.activeSessionCount,
                     totalActiveScans: parallelStats.totalActiveScans,
-                    avgSessionDuration: parallelStats.avgSessionDurationMinutes
+                    avgSessionDuration: parallelStats.avgSessionDurationMinutes,
+                    sessionTypesReady: this.sessionTypesInitialized
                 },
                 activeSessions: activeSessions.map(session => ({
                     sessionId: session.ID,
                     userId: session.UserID,
                     userName: session.UserName,
                     department: session.Department,
-                    startTime: session.StartTime,
+                    startTime: session.StartTS,
                     scanCount: session.ScanCount,
-                    durationMinutes: Math.round((new Date() - new Date(session.StartTime)) / (1000 * 60))
+                    durationMinutes: Math.round((new Date() - new Date(session.StartTS)) / (1000 * 60))
                 })),
                 recentActivity: recentActivity,
                 topPerformers: topPerformers,
@@ -838,6 +943,35 @@ class DatabaseClient {
         } catch (error) {
             console.error('Fehler beim Erstellen des Multi-User-Dashboards:', error);
             throw error;
+        }
+    }
+
+    /**
+     * System-Reset für Entwicklung/Tests (VORSICHT!)
+     * @returns {Object} - Reset-Ergebnis
+     */
+    async resetForDevelopment() {
+        console.warn('🚨 ACHTUNG: Entwicklungs-Reset wird ausgeführt!');
+
+        try {
+            // ALLE aktiven Sessions beenden
+            await this.endAllActiveSessions();
+
+            // Utils-Cache leeren
+            this.utils.cleanup();
+
+            return {
+                success: true,
+                message: 'System für Entwicklung zurückgesetzt',
+                timestamp: new Date().toISOString()
+            };
+
+        } catch (error) {
+            console.error('Fehler beim Entwicklungs-Reset:', error);
+            return {
+                success: false,
+                error: error.message
+            };
         }
     }
 }

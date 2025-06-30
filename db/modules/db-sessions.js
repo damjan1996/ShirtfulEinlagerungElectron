@@ -16,6 +16,7 @@ try {
 /**
  * Session Management Module
  * Handles session creation, management, and SessionType operations
+ * KORRIGIERT für Wareneinlagerung mit automatischem SessionTypes Setup
  */
 class SessionModule {
     constructor(dbConnection, utils) {
@@ -28,14 +29,15 @@ class SessionModule {
     /**
      * Erweiterte createSession Methode mit SessionType-Unterstützung
      * @param {number} userId - Benutzer-ID
-     * @param {number|string} sessionType - SessionType ID oder Name (default: 'Wareneingang')
+     * @param {number|string} sessionType - SessionType ID oder Name (default: 'Wareneinlagerung')
      * @returns {Object|null} - Neue Session oder null bei Fehler
      */
-    async createSession(userId, sessionType = 'Wareneingang') {
+    async createSession(userId, sessionType = 'Wareneinlagerung') {
         try {
             customConsole.info(`Session wird erstellt für User ${userId}, SessionType: ${sessionType}`);
 
-            // Bestehende aktive Sessions für diesen User beenden
+            // Bestehende aktive Sessions für diesen User beenden (für Single-User Modus)
+            // In Wareneinlagerung-Modus normalerweise nicht erforderlich, aber als Sicherheit
             await this.db.query(`
                 UPDATE dbo.Sessions
                 SET EndTS = SYSDATETIME(), Active = 0
@@ -56,10 +58,36 @@ class SessionModule {
                 `, [sessionType]);
 
                 if (typeResult.recordset.length === 0) {
-                    throw new Error(`SessionType '${sessionType}' nicht gefunden`);
-                }
+                    // Versuche zuerst SessionTypes Setup falls noch nicht vorhanden
+                    customConsole.warning(`SessionType '${sessionType}' nicht gefunden - versuche automatisches Setup...`);
 
-                sessionTypeId = typeResult.recordset[0].ID;
+                    try {
+                        const { setupSessionTypes } = require('../constants/session-types');
+                        const setupSuccess = await setupSessionTypes(this.db);
+
+                        if (setupSuccess) {
+                            // Nochmal versuchen
+                            const retryResult = await this.db.query(`
+                                SELECT ID FROM dbo.SessionTypes
+                                WHERE TypeName = ? AND IsActive = 1
+                            `, [sessionType]);
+
+                            if (retryResult.recordset.length > 0) {
+                                sessionTypeId = retryResult.recordset[0].ID;
+                                customConsole.success(`SessionType '${sessionType}' nach automatischem Setup gefunden`);
+                            } else {
+                                throw new Error(`SessionType '${sessionType}' auch nach Setup nicht gefunden`);
+                            }
+                        } else {
+                            throw new Error(`SessionType '${sessionType}' nicht gefunden und automatisches Setup fehlgeschlagen`);
+                        }
+                    } catch (setupError) {
+                        customConsole.error('Automatisches SessionTypes Setup fehlgeschlagen:', setupError);
+                        throw new Error(`SessionType '${sessionType}' nicht gefunden`);
+                    }
+                } else {
+                    sessionTypeId = typeResult.recordset[0].ID;
+                }
             }
 
             // Neue Session erstellen mit SessionType
@@ -96,13 +124,13 @@ class SessionModule {
 
             // Erst die aktuell aktiven Sessions abrufen (für Logging/Events)
             const activeSessionsResult = await this.db.query(`
-                SELECT 
+                SELECT
                     s.ID as SessionID,
                     s.UserID,
                     u.BenutzerName,
                     s.StartTS
                 FROM dbo.Sessions s
-                INNER JOIN dbo.ScannBenutzer u ON s.UserID = u.ID
+                         INNER JOIN dbo.ScannBenutzer u ON s.UserID = u.ID
                 WHERE s.Active = 1
             `);
 
@@ -228,7 +256,7 @@ class SessionModule {
 
     async endSession(sessionId) {
         try {
-            console.log(`[INFO] Beende Session: ${sessionId}`);
+            customConsole.info(`Beende Session: ${sessionId}`);
 
             const result = await this.db.query(`
                 UPDATE dbo.Sessions
@@ -241,7 +269,7 @@ class SessionModule {
             if (success) {
                 customConsole.success(`Session ${sessionId} erfolgreich beendet`);
             } else {
-                console.log(`[WARN] Session ${sessionId} war bereits beendet oder nicht gefunden`);
+                customConsole.warning(`Session ${sessionId} war bereits beendet oder nicht gefunden`);
             }
 
             return success;
@@ -371,6 +399,181 @@ class SessionModule {
         } catch (error) {
             customConsole.error('Fehler beim Abrufen der SessionType-Statistiken:', error);
             return [];
+        }
+    }
+
+    // ===== WARENEINLAGERUNG-SPEZIFISCHE METHODEN =====
+
+    /**
+     * WARENEINLAGERUNG: Session für Benutzer neu starten (Timer zurücksetzen)
+     * @param {number} sessionId - Session ID
+     * @param {number} userId - Benutzer ID (für Validierung)
+     * @returns {Object|null} - Aktualisierte Session-Daten
+     */
+    async restartSession(sessionId, userId) {
+        try {
+            customConsole.info(`Session ${sessionId} wird für Benutzer ${userId} neu gestartet...`);
+
+            const result = await this.db.query(`
+                UPDATE dbo.Sessions 
+                SET StartTS = SYSDATETIME()
+                OUTPUT INSERTED.ID, INSERTED.UserID, INSERTED.StartTS, INSERTED.Active, INSERTED.SessionTypeID
+                WHERE ID = ? AND UserID = ? AND Active = 1
+            `, [sessionId, userId]);
+
+            if (result.recordset.length === 0) {
+                customConsole.warning(`Session ${sessionId} für Benutzer ${userId} nicht gefunden oder nicht aktiv`);
+                return null;
+            }
+
+            const updatedSession = result.recordset[0];
+
+            // Session mit Typ-Informationen abrufen für vollständige Rückgabe
+            const sessionWithType = await this.getSessionWithType(sessionId);
+
+            customConsole.success(`Session ${sessionId} erfolgreich neu gestartet für Benutzer ${userId}`);
+            return sessionWithType;
+
+        } catch (error) {
+            customConsole.error('Fehler beim Neustarten der Session:', error);
+            return null;
+        }
+    }
+
+    /**
+     * WARENEINLAGERUNG: Prüft ob Benutzer bereits aktive Session hat
+     * @param {number} userId - Benutzer ID
+     * @returns {Object|null} - Aktive Session oder null
+     */
+    async getActiveSessionByUserId(userId) {
+        try {
+            const result = await this.db.query(`
+                SELECT 
+                    s.ID, 
+                    s.UserID, 
+                    s.StartTS, 
+                    s.EndTS, 
+                    s.Active,
+                    s.SessionTypeID,
+                    st.TypeName as SessionTypeName,
+                    u.BenutzerName as UserName
+                FROM dbo.Sessions s
+                LEFT JOIN dbo.SessionTypes st ON s.SessionTypeID = st.ID
+                INNER JOIN dbo.ScannBenutzer u ON s.UserID = u.ID
+                WHERE s.UserID = ? AND s.Active = 1
+                ORDER BY s.StartTS DESC
+            `, [userId]);
+
+            if (result.recordset.length === 0) {
+                return null;
+            }
+
+            const session = result.recordset[0];
+            return {
+                ID: session.ID,
+                UserID: session.UserID,
+                UserName: session.UserName,
+                SessionTypeID: session.SessionTypeID,
+                SessionTypeName: session.SessionTypeName,
+                StartTS: this.utils.normalizeTimestamp(session.StartTS),
+                EndTS: session.EndTS ? this.utils.normalizeTimestamp(session.EndTS) : null,
+                Active: session.Active
+            };
+
+        } catch (error) {
+            customConsole.error('Fehler beim Abrufen der aktiven Session für Benutzer:', error);
+            return null;
+        }
+    }
+
+    /**
+     * WARENEINLAGERUNG: Erweiterte Session-Informationen mit Scan-Counts
+     * @param {number} sessionId - Session ID
+     * @returns {Object|null} - Erweiterte Session-Informationen
+     */
+    async getSessionDetails(sessionId) {
+        try {
+            const result = await this.db.query(`
+                SELECT
+                    s.ID,
+                    s.UserID,
+                    s.StartTS,
+                    s.EndTS,
+                    s.Active,
+                    s.SessionTypeID,
+                    st.TypeName as SessionTypeName,
+                    st.Description as SessionTypeDescription,
+                    u.BenutzerName as UserName,
+                    u.Vorname,
+                    u.Nachname,
+                    DATEDIFF(SECOND, s.StartTS, ISNULL(s.EndTS, SYSDATETIME())) as DurationSeconds,
+                    COUNT(qr.ID) as TotalScans,
+                    COUNT(CASE WHEN qr.DecodedPayload IS NOT NULL AND qr.DecodedPayload != '{}' THEN 1 END) as ValidScans,
+                    MAX(qr.CapturedTS) as LastScanTime
+                FROM dbo.Sessions s
+                LEFT JOIN dbo.SessionTypes st ON s.SessionTypeID = st.ID
+                LEFT JOIN dbo.ScannBenutzer u ON s.UserID = u.ID
+                LEFT JOIN dbo.QrScans qr ON s.ID = qr.SessionID
+                WHERE s.ID = ?
+                GROUP BY s.ID, s.UserID, s.StartTS, s.EndTS, s.Active, s.SessionTypeID, 
+                         st.TypeName, st.Description, u.BenutzerName, u.Vorname, u.Nachname
+            `, [sessionId]);
+
+            if (result.recordset.length === 0) {
+                return null;
+            }
+
+            const session = result.recordset[0];
+            return {
+                ...session,
+                StartTS: this.utils.normalizeTimestamp(session.StartTS),
+                EndTS: session.EndTS ? this.utils.normalizeTimestamp(session.EndTS) : null,
+                LastScanTime: session.LastScanTime ? this.utils.normalizeTimestamp(session.LastScanTime) : null,
+                FullName: `${session.Vorname || ''} ${session.Nachname || ''}`.trim(),
+                FormattedDuration: this.utils.formatSessionDuration(session.DurationSeconds)
+            };
+        } catch (error) {
+            customConsole.error('Fehler beim Abrufen der Session-Details:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Setup SessionTypes falls noch nicht vorhanden
+     * @returns {boolean} - Success
+     */
+    async ensureSessionTypesExist() {
+        try {
+            customConsole.info('Prüfe SessionTypes-Verfügbarkeit...');
+
+            // Prüfe ob SessionTypes Tabelle existiert und SessionTypes vorhanden sind
+            const typesResult = await this.db.query(`
+                SELECT COUNT(*) as count FROM dbo.SessionTypes WHERE IsActive = 1
+            `);
+
+            const existingTypesCount = typesResult.recordset[0].count;
+
+            if (existingTypesCount === 0) {
+                customConsole.info('Keine SessionTypes gefunden - führe automatisches Setup aus...');
+
+                const { setupSessionTypes } = require('../constants/session-types');
+                const setupSuccess = await setupSessionTypes(this.db);
+
+                if (setupSuccess) {
+                    customConsole.success('SessionTypes automatisch eingerichtet');
+                    return true;
+                } else {
+                    customConsole.error('Automatisches SessionTypes Setup fehlgeschlagen');
+                    return false;
+                }
+            } else {
+                customConsole.info(`${existingTypesCount} SessionTypes bereits vorhanden`);
+                return true;
+            }
+
+        } catch (error) {
+            customConsole.error('Fehler beim Prüfen/Einrichten der SessionTypes:', error);
+            return false;
         }
     }
 }
