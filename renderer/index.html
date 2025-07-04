@@ -11,7 +11,7 @@
         img-src 'self' blob: data: https:;
         style-src 'self' 'unsafe-inline';
     ">
-    <title>RFID Wareneinlagerung - Shirtful</title>
+    <title>RFID Wareneinlagerung mit Qualitätskontrolle - Shirtful</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -19,7 +19,7 @@
 <header class="main-header">
     <div class="header-content">
         <div class="company-info">
-            <h1 class="app-title">📦 Wareneinlagerung</h1>
+            <h1 class="app-title">📦 Wareneinlagerung + QC</h1>
             <div class="company-name">Shirtful GmbH</div>
         </div>
 
@@ -27,6 +27,11 @@
             <div class="status-indicator" id="systemStatus">
                 <div class="status-dot"></div>
                 <span class="status-text">System wird gestartet...</span>
+            </div>
+            <!-- QC-System-Status -->
+            <div class="status-indicator qc-status" id="qcSystemStatus" style="display: none;">
+                <div class="status-dot qc"></div>
+                <span class="status-text">QC bereit</span>
             </div>
             <div class="current-time" id="currentTime">--:--:--</div>
         </div>
@@ -48,6 +53,7 @@
             <div class="login-info">
                 <p>💡 Mehrere Mitarbeiter können gleichzeitig arbeiten</p>
                 <p>🔄 Erneutes Scannen startet Ihre Session neu</p>
+                <p>🔍 <strong>NEU:</strong> Doppelte QR-Scans für Qualitätskontrolle</p>
             </div>
         </div>
     </section>
@@ -66,6 +72,61 @@
             </div>
         </div>
 
+        <!-- QC-Panel (wird dynamisch hinzugefügt durch qc-manager.js) -->
+        <div class="qc-panel" id="qcPanel" style="display: none;">
+            <div class="qc-header">
+                <h3>🔍 Qualitätskontrolle</h3>
+                <div class="qc-status" id="qcStatus">
+                    <span class="qc-status-dot active"></span>
+                    <span class="qc-status-text">System bereit</span>
+                </div>
+            </div>
+
+            <div class="qc-content">
+                <!-- Aktive QC-Schritte -->
+                <div class="qc-section">
+                    <div class="qc-section-header">
+                        <h4>📋 Aktive QC-Schritte</h4>
+                        <span class="qc-counter" id="activeQCCounter">0</span>
+                    </div>
+                    <div class="qc-steps-list" id="qcStepsList">
+                        <div class="qc-no-steps">Keine aktiven QC-Schritte</div>
+                    </div>
+                </div>
+
+                <!-- QC-Statistiken -->
+                <div class="qc-section">
+                    <div class="qc-section-header">
+                        <h4>📊 QC-Statistiken</h4>
+                        <button class="btn-small qc-refresh-btn" id="qcRefreshBtn">🔄</button>
+                    </div>
+                    <div class="qc-statistics" id="qcStatistics">
+                        <div class="qc-stat">
+                            <span class="qc-stat-label">Abgeschlossen heute:</span>
+                            <span class="qc-stat-value" id="qcCompletedToday">0</span>
+                        </div>
+                        <div class="qc-stat">
+                            <span class="qc-stat-label">Durchschnittsdauer:</span>
+                            <span class="qc-stat-value" id="qcAvgDuration">0 Min</span>
+                        </div>
+                        <div class="qc-stat">
+                            <span class="qc-stat-label">Abschlussrate:</span>
+                            <span class="qc-stat-value" id="qcCompletionRate">0%</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Überfällige Warnungen -->
+                <div class="qc-section qc-overdue-section" id="qcOverdueSection" style="display: none;">
+                    <div class="qc-section-header">
+                        <h4>⚠️ Überfällige QC-Schritte</h4>
+                        <span class="qc-counter warning" id="overdueQCCounter">0</span>
+                    </div>
+                    <div class="qc-overdue-list" id="qcOverdueList"></div>
+                </div>
+            </div>
+        </div>
+
         <!-- Hauptarbeitsbereich -->
         <div class="main-work-area">
             <!-- Ausgewählter Benutzer Info -->
@@ -77,6 +138,10 @@
                         <div class="user-session-info">
                             <span class="session-time" id="selectedSessionTime">00:00:00</span>
                             <span class="session-scans">• <span id="selectedSessionScans">0</span> Scans</span>
+                            <!-- QC-Info für ausgewählten Benutzer -->
+                            <span class="session-qc-info" id="selectedSessionQCInfo" style="display: none;">
+                                • <span id="selectedSessionQC">0</span> QC aktiv
+                            </span>
                         </div>
                     </div>
                     <div class="user-actions">
@@ -94,6 +159,10 @@
                     <h3>📸 QR-Code Scanner</h3>
                     <div class="scanner-info-bar">
                         <span id="scannerUserInfo">Wählen Sie einen Mitarbeiter aus</span>
+                        <!-- QC-Modus-Anzeige -->
+                        <span class="qc-mode-indicator" id="qcModeIndicator" style="display: none;">
+                            🔍 QC-Modus aktiv
+                        </span>
                     </div>
                     <div class="scanner-controls">
                         <button class="btn-primary" id="startScannerBtn">
@@ -101,6 +170,10 @@
                         </button>
                         <button class="btn-secondary" id="stopScannerBtn" style="display: none;">
                             ⏹️ Scanner stoppen
+                        </button>
+                        <!-- QC-Modus Toggle -->
+                        <button class="btn-qc-toggle" id="qcModeToggle" style="display: none;" title="QC-Modus umschalten">
+                            🔍 QC
                         </button>
                     </div>
                 </div>
@@ -115,6 +188,13 @@
                             <div class="corner tr"></div>
                             <div class="corner bl"></div>
                             <div class="corner br"></div>
+                        </div>
+                        <!-- QC-Overlay-Indikator -->
+                        <div class="qc-scan-overlay" id="qcScanOverlay" style="display: none;">
+                            <div class="qc-scan-message">
+                                <div class="qc-scan-icon">🔍</div>
+                                <div class="qc-scan-text" id="qcScanText">QC-Schritt 1: Eingang scannen</div>
+                            </div>
                         </div>
                     </div>
                     <div class="camera-status" id="cameraStatus">
@@ -134,6 +214,11 @@
                         <span class="info-label">Letzter Scan:</span>
                         <span class="info-value" id="lastScanTime">-</span>
                     </div>
+                    <!-- QC-spezifische Info -->
+                    <div class="info-row qc-info-row" id="qcInfoRow" style="display: none;">
+                        <span class="info-label">QC-Status:</span>
+                        <span class="info-value" id="qcStatusInfo">Bereit</span>
+                    </div>
                 </div>
             </div>
 
@@ -144,6 +229,10 @@
                     <div class="scans-controls">
                         <button class="btn-secondary btn-small" id="clearScansBtn">🗑️ Leeren</button>
                         <button class="btn-secondary btn-small" id="refreshScansBtn">🔄 Aktualisieren</button>
+                        <!-- QC-Filter -->
+                        <button class="btn-secondary btn-small qc-filter-btn" id="qcFilterBtn" style="display: none;">
+                            🔍 Nur QC
+                        </button>
                     </div>
                 </div>
 
@@ -158,6 +247,21 @@
                     </div>
                     <div class="current-scan-content" id="currentScanContent">Noch kein QR-Code gescannt</div>
                     <div class="current-scan-message" id="currentScanMessage">Scannen Sie einen QR-Code</div>
+
+                    <!-- QC-spezifische Anzeige -->
+                    <div class="current-scan-qc-info" id="currentScanQCInfo" style="display: none;">
+                        <div class="qc-step-info">
+                            <span class="qc-step-label" id="qcStepLabel">QC-Schritt:</span>
+                            <span class="qc-step-value" id="qcStepValue">1/2 (Eingang)</span>
+                        </div>
+                        <div class="qc-duration-info" id="qcDurationInfo">
+                            <span class="qc-duration-label">Dauer:</span>
+                            <span class="qc-duration-value" id="qcDurationValue">0 Min</span>
+                        </div>
+                        <div class="qc-next-step" id="qcNextStep">
+                            Scannen Sie den gleichen QR-Code erneut für Ausgang
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Erfolgreich gescannte Pakete - Tabellenansicht -->
@@ -170,6 +274,8 @@
                             <th class="auftrag-col">Auftrags-ID</th>
                             <th class="kunde-col">Kunden-ID</th>
                             <th class="paket-col">Paket-ID</th>
+                            <!-- QC-Spalte -->
+                            <th class="qc-col" id="qcColumn" style="display: none;">QC</th>
                         </tr>
                         </thead>
                         <tbody id="successScansTableBody">
@@ -180,6 +286,9 @@
                     <div class="empty-scans" id="emptySuccessScans">
                         <div class="empty-icon">📦</div>
                         <p>Noch keine Pakete erfolgreich gescannt</p>
+                        <p class="qc-hint" id="qcHint" style="display: none;">
+                            🔍 Mit QC: Scannen Sie jeden QR-Code zweimal für vollständige Qualitätsprüfung
+                        </p>
                     </div>
                 </div>
             </div>
@@ -191,12 +300,15 @@
 <footer class="main-footer">
     <div class="footer-content">
         <div class="footer-left">
-            <span id="instructionText">💡 RFID-Tag scannen = Anmelden • QR-Code scannen = Paket einlagern • Erneuter RFID-Scan = Session neu starten</span>
+            <span id="instructionText">💡 RFID-Tag scannen = Anmelden • QR-Code scannen = Paket einlagern • QC: Doppelt scannen für Qualitätsprüfung</span>
         </div>
         <div class="footer-right">
-            <span id="versionText">v1.0.0</span>
+            <span id="versionText">v1.1.0</span>
             <span class="separator">•</span>
             <span id="dateText">--.--.----</span>
+            <!-- QC-Indikator im Footer -->
+            <span class="separator">•</span>
+            <span id="qcFooterStatus" style="display: none;">🔍 QC aktiv</span>
         </div>
     </div>
 </footer>
@@ -256,6 +368,12 @@
         <div class="modal-body">
             <p>Möchten Sie <strong id="logoutUserName"></strong> wirklich abmelden?</p>
             <p class="modal-warning">Die Session wird beendet und alle ungespeicherten Daten gehen verloren.</p>
+            <!-- QC-Warnung -->
+            <div class="modal-qc-warning" id="logoutQCWarning" style="display: none;">
+                <p class="qc-warning-text">⚠️ <strong>Achtung:</strong> Dieser Benutzer hat aktive QC-Schritte:</p>
+                <ul class="qc-warning-list" id="logoutQCList"></ul>
+                <p>Diese QC-Schritte werden abgebrochen!</p>
+            </div>
         </div>
         <div class="modal-footer">
             <button class="btn-danger" id="confirmLogout">Ja, abmelden</button>
@@ -277,6 +395,11 @@
         <div class="modal-body">
             <p>Möchten Sie die Session von <strong id="restartUserName"></strong> neu starten?</p>
             <p class="modal-info">Der Timer wird zurückgesetzt und die Session beginnt von vorne.</p>
+            <!-- QC-Warnung -->
+            <div class="modal-qc-warning" id="restartQCWarning" style="display: none;">
+                <p class="qc-warning-text">⚠️ <strong>Achtung:</strong> Aktive QC-Schritte werden abgebrochen:</p>
+                <ul class="qc-warning-list" id="restartQCList"></ul>
+            </div>
         </div>
         <div class="modal-footer">
             <button class="btn-primary" id="confirmSessionRestart">Ja, neu starten</button>
@@ -285,6 +408,81 @@
     </div>
 </div>
 
+<!-- QC Completion Modal -->
+<div class="modal" id="qcCompletionModal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 class="modal-title">
+                <span class="icon">✅</span>
+                Qualitätsprüfung abgeschlossen
+            </h3>
+            <button class="modal-close" id="qcCompletionModalClose">✕</button>
+        </div>
+        <div class="modal-body">
+            <div class="qc-completion-info">
+                <div class="qc-completion-qr">
+                    <strong>QR-Code:</strong> <span id="qcCompletionQRCode"></span>
+                </div>
+                <div class="qc-completion-duration">
+                    <strong>Dauer:</strong> <span id="qcCompletionDuration"></span> Minuten
+                </div>
+                <div class="qc-completion-user">
+                    <strong>Mitarbeiter:</strong> <span id="qcCompletionUser"></span>
+                </div>
+            </div>
+
+            <!-- Optional: Qualitätsbewertung -->
+            <div class="qc-rating-section" id="qcRatingSection" style="display: none;">
+                <h4>Qualitätsbewertung (optional):</h4>
+                <div class="qc-rating-stars">
+                    <button class="qc-star" data-rating="1">⭐</button>
+                    <button class="qc-star" data-rating="2">⭐</button>
+                    <button class="qc-star" data-rating="3">⭐</button>
+                    <button class="qc-star" data-rating="4">⭐</button>
+                    <button class="qc-star" data-rating="5">⭐</button>
+                </div>
+                <textarea class="qc-notes" id="qcNotes" placeholder="Notizen zur Qualitätsprüfung (optional)"></textarea>
+            </div>
+
+            <!-- Session-Reset-Option -->
+            <div class="qc-session-reset-option" id="qcSessionResetOption">
+                <label class="qc-checkbox-label">
+                    <input type="checkbox" id="qcAutoSessionReset" checked>
+                    Session automatisch beenden nach QC-Abschluss
+                </label>
+                <p class="qc-reset-info">Empfohlen für optimalen QC-Workflow</p>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn-primary" id="qcCompletionConfirm">QC abschließen</button>
+            <button class="btn-secondary" id="qcCompletionCancel">Abbrechen</button>
+        </div>
+    </div>
+</div>
+
+<!-- QC Overdue Warning Modal -->
+<div class="modal" id="qcOverdueModal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 class="modal-title">
+                <span class="icon">⚠️</span>
+                QC-Schritte überfällig
+            </h3>
+            <button class="modal-close" id="qcOverdueModalClose">✕</button>
+        </div>
+        <div class="modal-body">
+            <p>Die folgenden QC-Schritte sind überfällig:</p>
+            <div class="qc-overdue-details" id="qcOverdueDetails"></div>
+            <p class="qc-overdue-hint">Bitte scannen Sie die entsprechenden QR-Codes erneut, um die Qualitätsprüfung abzuschließen.</p>
+        </div>
+        <div class="modal-footer">
+            <button class="btn-primary" id="qcOverdueOk">Verstanden</button>
+        </div>
+    </div>
+</div>
+
+<!-- Scripts -->
+<script src="qc-manager.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
