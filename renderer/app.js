@@ -1,6 +1,7 @@
 /**
- * RFID Wareneinlagerung - Hauptanwendung für parallele Sessions
+ * RFID Wareneinlagerung - Hauptanwendung für parallele Sessions mit Qualitätskontrolle
  * Ermöglicht mehreren Mitarbeitern gleichzeitig zu arbeiten
+ * ERWEITERT für Quality Control mit doppelten QR-Scans und automatischem Session-Reset
  */
 
 class WareneinlagerungApp {
@@ -33,6 +34,39 @@ class WareneinlagerungApp {
         this.lastProcessedQR = null;
         this.lastProcessedTime = 0;
 
+        // ===== QUALITÄTSKONTROLLE INTEGRATION =====
+        this.qcManager = null; // QC Manager Instanz
+        this.qcEnabled = false; // QC-System aktiviert
+        this.qcMode = 'auto'; // 'auto', 'manual', 'disabled'
+        this.qcConfig = {
+            enableAutoSessionReset: true,
+            showQCProgress: true,
+            enableQCNotifications: true,
+            enableQCAudio: true,
+            defaultEstimatedMinutes: 15,
+            overdueThresholdMinutes: 30
+        };
+
+        // QC-spezifische UI-Status
+        this.qcUIElements = {
+            qcPanel: null,
+            qcModeIndicator: null,
+            qcModeToggle: null,
+            qcScanOverlay: null,
+            qcInfoRow: null,
+            qcColumn: null,
+            qcHint: null,
+            qcFooterStatus: null
+        };
+
+        // QC-Event-Handler
+        this.qcEventHandlers = {
+            qcStepStarted: this.handleQCStepStarted.bind(this),
+            qcStepCompleted: this.handleQCStepCompleted.bind(this),
+            qcStepOverdue: this.handleQCStepOverdue.bind(this),
+            sessionAutoReset: this.handleSessionAutoReset.bind(this)
+        };
+
         this.init();
     }
 
@@ -44,6 +78,9 @@ class WareneinlagerungApp {
         this.startClockUpdate();
         this.updateSystemInfo();
 
+        // QC-System initialisieren
+        await this.initializeQualityControl();
+
         // Kamera-Verfügbarkeit prüfen
         await this.checkCameraAvailability();
 
@@ -51,6 +88,221 @@ class WareneinlagerungApp {
         this.startPeriodicSessionUpdate();
 
         console.log('✅ Wareneinlagerung-App bereit');
+    }
+
+    // ===== QUALITY CONTROL INITIALIZATION =====
+
+    async initializeQualityControl() {
+        try {
+            console.log('🔍 Initialisiere Qualitätskontrolle...');
+
+            // QC-System-Status prüfen
+            const systemStatus = await window.electronAPI.system.getStatus();
+            this.qcEnabled = systemStatus?.qualityControl?.enabled || false;
+
+            if (this.qcEnabled) {
+                // QC Manager initialisieren
+                if (typeof QualityControlManager !== 'undefined') {
+                    this.qcManager = new QualityControlManager(this);
+                    console.log('✅ QC Manager initialisiert');
+                } else {
+                    console.warn('⚠️ QC Manager nicht verfügbar - loading...');
+                    // Versuche QC Manager nachzuladen
+                    await this.loadQCManager();
+                }
+
+                // QC-UI-Elemente cachen
+                this.cacheQCUIElements();
+
+                // QC-spezifische Event-Listener einrichten
+                this.setupQCEventListeners();
+
+                // QC-UI aktivieren
+                this.activateQCUI();
+
+                console.log('✅ Qualitätskontrolle erfolgreich initialisiert');
+            } else {
+                console.log('ℹ️ Qualitätskontrolle nicht verfügbar');
+                this.hideQCUI();
+            }
+
+        } catch (error) {
+            console.error('❌ Fehler bei QC-Initialisierung:', error);
+            this.qcEnabled = false;
+            this.hideQCUI();
+        }
+    }
+
+    async loadQCManager() {
+        return new Promise((resolve, reject) => {
+            if (typeof QualityControlManager !== 'undefined') {
+                this.qcManager = new QualityControlManager(this);
+                resolve();
+                return;
+            }
+
+            // QC Manager ist noch nicht geladen - warten
+            let attempts = 0;
+            const maxAttempts = 50;
+            const checkInterval = setInterval(() => {
+                attempts++;
+                if (typeof QualityControlManager !== 'undefined') {
+                    clearInterval(checkInterval);
+                    this.qcManager = new QualityControlManager(this);
+                    resolve();
+                } else if (attempts >= maxAttempts) {
+                    clearInterval(checkInterval);
+                    console.warn('⚠️ QC Manager konnte nicht geladen werden');
+                    reject(new Error('QC Manager timeout'));
+                }
+            }, 100);
+        });
+    }
+
+    cacheQCUIElements() {
+        this.qcUIElements = {
+            qcPanel: document.getElementById('qcPanel'),
+            qcModeIndicator: document.getElementById('qcModeIndicator'),
+            qcModeToggle: document.getElementById('qcModeToggle'),
+            qcScanOverlay: document.getElementById('qcScanOverlay'),
+            qcInfoRow: document.getElementById('qcInfoRow'),
+            qcColumn: document.getElementById('qcColumn'),
+            qcHint: document.getElementById('qcHint'),
+            qcFooterStatus: document.getElementById('qcFooterStatus'),
+            qcSystemStatus: document.getElementById('qcSystemStatus')
+        };
+    }
+
+    setupQCEventListeners() {
+        if (!this.qcEnabled) return;
+
+        // QC-Modus Toggle
+        const qcModeToggle = this.qcUIElements.qcModeToggle;
+        if (qcModeToggle) {
+            qcModeToggle.addEventListener('click', () => {
+                this.toggleQCMode();
+            });
+        }
+
+        // QC-spezifische Modals
+        this.setupQCModals();
+
+        console.log('📡 QC-Event-Listener eingerichtet');
+    }
+
+    setupQCModals() {
+        // QC Completion Modal
+        const qcCompletionModal = document.getElementById('qcCompletionModal');
+        const qcCompletionConfirm = document.getElementById('qcCompletionConfirm');
+        const qcCompletionCancel = document.getElementById('qcCompletionCancel');
+        const qcCompletionClose = document.getElementById('qcCompletionModalClose');
+
+        if (qcCompletionConfirm) {
+            qcCompletionConfirm.addEventListener('click', () => this.confirmQCCompletion());
+        }
+
+        if (qcCompletionCancel) {
+            qcCompletionCancel.addEventListener('click', () => this.hideModal('qcCompletionModal'));
+        }
+
+        if (qcCompletionClose) {
+            qcCompletionClose.addEventListener('click', () => this.hideModal('qcCompletionModal'));
+        }
+
+        // QC Overdue Modal
+        const qcOverdueOk = document.getElementById('qcOverdueOk');
+        const qcOverdueClose = document.getElementById('qcOverdueModalClose');
+
+        if (qcOverdueOk) {
+            qcOverdueOk.addEventListener('click', () => this.hideModal('qcOverdueModal'));
+        }
+
+        if (qcOverdueClose) {
+            qcOverdueClose.addEventListener('click', () => this.hideModal('qcOverdueModal'));
+        }
+
+        // Star Rating System
+        document.querySelectorAll('.qc-star').forEach(star => {
+            star.addEventListener('click', (e) => {
+                const rating = parseInt(e.target.dataset.rating);
+                this.setQCRating(rating);
+            });
+        });
+
+        // Modal Click-Outside-to-Close für QC-Modals
+        [qcCompletionModal, document.getElementById('qcOverdueModal')].forEach(modal => {
+            if (modal) {
+                modal.addEventListener('click', (e) => {
+                    if (e.target === modal) {
+                        this.hideModal(modal.id);
+                    }
+                });
+            }
+        });
+    }
+
+    activateQCUI() {
+        if (!this.qcEnabled) return;
+
+        // QC-Panel anzeigen
+        if (this.qcUIElements.qcPanel) {
+            this.qcUIElements.qcPanel.style.display = 'block';
+        }
+
+        // QC-System-Status anzeigen
+        if (this.qcUIElements.qcSystemStatus) {
+            this.qcUIElements.qcSystemStatus.style.display = 'flex';
+        }
+
+        // QC-Modus-Toggle anzeigen
+        if (this.qcUIElements.qcModeToggle) {
+            this.qcUIElements.qcModeToggle.style.display = 'inline-flex';
+        }
+
+        // QC-Spalte in Tabelle anzeigen
+        if (this.qcUIElements.qcColumn) {
+            this.qcUIElements.qcColumn.style.display = 'table-cell';
+        }
+
+        // QC-Hinweis anzeigen
+        if (this.qcUIElements.qcHint) {
+            this.qcUIElements.qcHint.style.display = 'block';
+        }
+
+        // QC-Footer-Status anzeigen
+        if (this.qcUIElements.qcFooterStatus) {
+            this.qcUIElements.qcFooterStatus.style.display = 'inline';
+        }
+
+        // QC-Info-Row anzeigen
+        if (this.qcUIElements.qcInfoRow) {
+            this.qcUIElements.qcInfoRow.style.display = 'flex';
+        }
+
+        // Workspace-Grid für QC-Panel anpassen
+        const workspace = document.getElementById('workspace');
+        if (workspace) {
+            workspace.style.gridTemplateColumns = '320px 280px 1fr';
+        }
+
+        console.log('🎨 QC-UI aktiviert');
+    }
+
+    hideQCUI() {
+        // Alle QC-UI-Elemente ausblenden
+        Object.values(this.qcUIElements).forEach(element => {
+            if (element) {
+                element.style.display = 'none';
+            }
+        });
+
+        // Workspace-Grid ohne QC-Panel
+        const workspace = document.getElementById('workspace');
+        if (workspace) {
+            workspace.style.gridTemplateColumns = '320px 1fr';
+        }
+
+        console.log('🎨 QC-UI ausgeblendet');
     }
 
     // ===== EVENT LISTENERS =====
@@ -143,6 +395,11 @@ class WareneinlagerungApp {
             console.log('System bereit:', data);
             this.updateSystemStatus('active', 'System bereit');
             this.showNotification('success', 'System bereit', 'RFID und Datenbank verbunden');
+
+            // QC-System-Status aktualisieren
+            if (data.qualityControl && data.qualityControl.enabled) {
+                this.updateQCSystemStatus('active', 'QC bereit');
+            }
         });
 
         // System-Fehler
@@ -180,6 +437,131 @@ class WareneinlagerungApp {
             console.error('RFID-Fehler:', data);
             this.showNotification('error', 'RFID-Fehler', data.message);
         });
+
+        // ===== QC-SPEZIFISCHE IPC-LISTENER =====
+        if (this.qcEnabled) {
+            // QC-Schritt gestartet
+            window.electronAPI.on('qc-step-started', (data) => {
+                this.handleQCStepStarted(data);
+            });
+
+            // QC-Schritt abgeschlossen
+            window.electronAPI.on('qc-step-completed', (data) => {
+                this.handleQCStepCompleted(data);
+            });
+
+            // QC-Schritt überfällig
+            window.electronAPI.on('qc-step-overdue', (data) => {
+                this.handleQCStepOverdue(data);
+            });
+
+            // Session automatisch nach QC beendet
+            window.electronAPI.on('session-auto-reset', (data) => {
+                this.handleSessionAutoReset(data);
+            });
+        }
+    }
+
+    // ===== QC EVENT HANDLERS =====
+
+    handleQCStepStarted(data) {
+        console.log('🔍 QC-Schritt gestartet:', data);
+
+        if (this.qcManager) {
+            // QC Manager über neuen Schritt informieren
+            this.qcManager.handleQCStepStarted(data);
+        }
+
+        // UI-Updates für QC-Start
+        this.updateQCModeDisplay(true);
+        this.updateQCInfoRow('QC läuft', 'active');
+
+        // Spezielle Benachrichtigung für QC-Start
+        this.showNotification('info', 'QC gestartet',
+            `Qualitätsprüfung für ${data.qrCode?.substring(0, 8)}... begonnen`);
+    }
+
+    handleQCStepCompleted(data) {
+        console.log('✅ QC-Schritt abgeschlossen:', data);
+
+        if (this.qcManager) {
+            // QC Manager über Abschluss informieren
+            this.qcManager.handleQCStepCompleted(data);
+        }
+
+        // UI-Updates für QC-Abschluss
+        this.updateQCModeDisplay(false);
+        this.updateQCInfoRow('QC abgeschlossen', 'completed');
+
+        // QC-Completion-Modal anzeigen (optional)
+        if (this.qcConfig.showQCProgress) {
+            this.showQCCompletionModal(data);
+        }
+
+        // Spezielle Benachrichtigung für QC-Abschluss
+        let message = `Qualitätsprüfung abgeschlossen (${data.durationMinutes} Min)`;
+        if (data.autoSessionReset) {
+            message += ' - Session automatisch beendet';
+        }
+
+        this.showNotification('success', 'QC abgeschlossen', message);
+
+        // Session-Reset behandeln
+        if (data.autoSessionReset && data.sessionId) {
+            this.handleSessionAutoReset({
+                sessionId: data.sessionId,
+                userId: data.userId,
+                reason: 'QC abgeschlossen'
+            });
+        }
+    }
+
+    handleQCStepOverdue(data) {
+        console.warn('⚠️ QC-Schritt überfällig:', data);
+
+        if (this.qcManager) {
+            // QC Manager über Überfälligkeit informieren
+            this.qcManager.handleQCStepOverdue(data);
+        }
+
+        // UI-Updates für überfällige QC-Schritte
+        this.updateQCInfoRow('QC überfällig', 'overdue');
+
+        // Überfällig-Modal anzeigen
+        this.showQCOverdueModal(data);
+
+        // Dringende Benachrichtigung
+        this.showNotification('warning', 'QC überfällig',
+            `Qualitätsprüfung für ${data.qrCode?.substring(0, 8)}... ist ${data.minutesInProgress} Min überfällig`);
+    }
+
+    handleSessionAutoReset(data) {
+        console.log('🔄 Session automatisch nach QC beendet:', data);
+
+        // Session aus lokaler Verwaltung entfernen
+        if (data.userId) {
+            this.activeSessions.delete(data.userId);
+            this.stopSessionTimer(data.userId);
+
+            // Falls diese Session ausgewählt war, Auswahl zurücksetzen
+            if (this.selectedSession && this.selectedSession.userId === data.userId) {
+                this.selectedSession = null;
+                this.updateSelectedUserDisplay();
+                this.updateScannerInfo();
+            }
+        }
+
+        // UI aktualisieren
+        this.updateActiveUsersDisplay();
+        this.updateWorkspaceVisibility();
+
+        // QC-Modus zurücksetzen
+        this.updateQCModeDisplay(false);
+        this.updateQCInfoRow('Bereit', 'ready');
+
+        // Benachrichtigung
+        this.showNotification('info', 'Session beendet',
+            `${data.userName || 'Mitarbeiter'} wurde nach QC-Abschluss automatisch abgemeldet`);
     }
 
     // ===== PARALLELE SESSION MANAGEMENT =====
@@ -209,7 +591,11 @@ class WareneinlagerungApp {
 
         // Spezielle Nachrichten für neue Sessions
         if (eventData.isNewSession) {
-            this.showNotification('success', 'Neue Session', `${user.BenutzerName} ist bereit zum Arbeiten!`);
+            let message = `${user.BenutzerName} ist bereit zum Arbeiten!`;
+            if (this.qcEnabled) {
+                message += ' QC-Modus verfügbar.';
+            }
+            this.showNotification('success', 'Neue Session', message);
         } else {
             this.showNotification('success', 'Angemeldet', `${user.BenutzerName} ist bereit!`);
         }
@@ -238,6 +624,10 @@ class WareneinlagerungApp {
             this.selectedSession = null;
             this.updateSelectedUserDisplay();
             this.updateScannerInfo();
+
+            // QC-Modus zurücksetzen
+            this.updateQCModeDisplay(false);
+            this.updateQCInfoRow('Bereit', 'ready');
         }
 
         // UI aktualisieren
@@ -268,7 +658,16 @@ class WareneinlagerungApp {
             this.updateSelectedUserDisplay();
         }
 
-        this.showNotification('info', 'Session neu gestartet', `${data.user.BenutzerName}: Timer zurückgesetzt`);
+        let message = `${data.user.BenutzerName}: Timer zurückgesetzt`;
+        if (this.qcEnabled && this.qcManager) {
+            // QC-Schritte für diese Session abbrechen
+            const sessionQCSteps = this.qcManager.getActiveQCStepsForSession(session.sessionId);
+            if (sessionQCSteps.length > 0) {
+                message += ` (${sessionQCSteps.length} QC-Schritte abgebrochen)`;
+            }
+        }
+
+        this.showNotification('info', 'Session neu gestartet', message);
     }
 
     handleSessionTimerUpdate(data) {
@@ -375,6 +774,8 @@ class WareneinlagerungApp {
                         department: backendSession.Department || '',
                         startTime: new Date(backendSession.StartTS),
                         scanCount: backendSession.ScanCount || 0,
+                        activeQCSteps: backendSession.ActiveQCSteps || 0,
+                        completedQCSteps: backendSession.CompletedQCSteps || 0,
                         isActive: true
                     });
 
@@ -422,6 +823,12 @@ class WareneinlagerungApp {
         const duration = utils.calculateSessionDuration(session.startTime);
         const isSelected = this.selectedSession && this.selectedSession.userId === session.userId;
 
+        // QC-Informationen vorbereiten
+        const qcInfo = this.qcEnabled && this.qcManager ?
+            this.qcManager.getActiveQCStepsForSession(session.sessionId) : [];
+        const hasActiveQC = qcInfo.length > 0;
+        const hasOverdueQC = qcInfo.some(step => step.status === 'overdue');
+
         return `
             <div class="user-card ${isSelected ? 'selected' : ''}" 
                  data-user-id="${session.userId}" 
@@ -429,10 +836,14 @@ class WareneinlagerungApp {
                 <div class="user-main">
                     <div class="user-avatar">👤</div>
                     <div class="user-info">
-                        <div class="user-name">${session.userName}</div>
+                        <div class="user-name">
+                            ${session.userName}
+                            ${hasActiveQC ? `<span class="qc-status-indicator ${hasOverdueQC ? 'overdue' : 'active'}" title="${hasOverdueQC ? 'Überfällige QC-Schritte' : 'Aktive QC-Schritte'}"></span>` : ''}
+                        </div>
                         <div class="user-department">${session.department}</div>
                         <div class="user-timer">${utils.formatDuration(duration)}</div>
                         <div class="user-scans">${session.scanCount} Scans</div>
+                        ${hasActiveQC ? `<div class="user-qc-info">${qcInfo.length} QC aktiv${hasOverdueQC ? ' (überfällig)' : ''}</div>` : ''}
                     </div>
                 </div>
                 <div class="user-actions">
@@ -509,6 +920,9 @@ class WareneinlagerungApp {
         this.updateSelectedUserDisplay();
         this.updateScannerInfo();
 
+        // QC-spezifische Updates
+        this.updateQCUserSelection();
+
         // Scan-Historie für ausgewählten Benutzer laden
         this.refreshScansForSelectedUser();
 
@@ -527,6 +941,20 @@ class WareneinlagerungApp {
 
         document.getElementById('selectedUserName').textContent = this.selectedSession.userName;
         document.getElementById('selectedSessionScans').textContent = this.selectedSession.scanCount;
+
+        // QC-Information für ausgewählten Benutzer
+        if (this.qcEnabled && this.qcManager) {
+            const qcSteps = this.qcManager.getActiveQCStepsForSession(this.selectedSession.sessionId);
+            const qcInfoElement = document.getElementById('selectedSessionQCInfo');
+            const qcCountElement = document.getElementById('selectedSessionQC');
+
+            if (qcSteps.length > 0) {
+                qcInfoElement.style.display = 'inline';
+                qcCountElement.textContent = qcSteps.length;
+            } else {
+                qcInfoElement.style.display = 'none';
+            }
+        }
 
         this.updateSelectedSessionTimer();
     }
@@ -560,11 +988,113 @@ class WareneinlagerungApp {
         this.updateWorkspaceVisibility();
     }
 
+    // ===== QC-SPEZIFISCHE UI UPDATES =====
+
+    updateQCUserSelection() {
+        if (!this.qcEnabled) return;
+
+        // QC-Modus-Anzeige aktualisieren
+        this.updateQCModeDisplay();
+
+        // QC-Informationen für ausgewählten Benutzer laden
+        if (this.selectedSession && this.qcManager) {
+            const qcSteps = this.qcManager.getActiveQCStepsForSession(this.selectedSession.sessionId);
+
+            if (qcSteps.length > 0) {
+                this.updateQCInfoRow(`${qcSteps.length} QC aktiv`, 'active');
+            } else {
+                this.updateQCInfoRow('Bereit für QC', 'ready');
+            }
+        }
+    }
+
+    updateQCModeDisplay(active = null) {
+        if (!this.qcEnabled) return;
+
+        const qcModeIndicator = this.qcUIElements.qcModeIndicator;
+
+        if (active === null) {
+            // Auto-Erkennung basierend auf ausgewähltem Benutzer
+            if (this.selectedSession && this.qcManager) {
+                const qcSteps = this.qcManager.getActiveQCStepsForSession(this.selectedSession.sessionId);
+                active = qcSteps.length > 0;
+            } else {
+                active = false;
+            }
+        }
+
+        if (qcModeIndicator) {
+            if (active) {
+                qcModeIndicator.style.display = 'inline';
+                qcModeIndicator.className = 'qc-mode-indicator active';
+                qcModeIndicator.textContent = '🔍 QC läuft';
+            } else {
+                qcModeIndicator.style.display = 'none';
+            }
+        }
+
+        // QC-Scan-Overlay aktualisieren
+        const qcScanOverlay = this.qcUIElements.qcScanOverlay;
+        if (qcScanOverlay) {
+            if (active) {
+                qcScanOverlay.style.display = 'flex';
+                const qcScanText = document.getElementById('qcScanText');
+                if (qcScanText) {
+                    qcScanText.textContent = 'QC-Schritt 2: Ausgang scannen';
+                }
+            } else {
+                qcScanOverlay.style.display = 'none';
+            }
+        }
+    }
+
+    updateQCInfoRow(status, type = 'ready') {
+        if (!this.qcEnabled) return;
+
+        const qcStatusInfo = document.getElementById('qcStatusInfo');
+        if (qcStatusInfo) {
+            qcStatusInfo.textContent = status;
+            qcStatusInfo.className = `info-value qc-status-${type}`;
+        }
+    }
+
+    updateQCSystemStatus(status, message) {
+        const qcSystemStatus = this.qcUIElements.qcSystemStatus;
+        if (qcSystemStatus) {
+            const statusDot = qcSystemStatus.querySelector('.status-dot');
+            const statusText = qcSystemStatus.querySelector('.status-text');
+
+            if (statusDot) statusDot.className = `status-dot qc ${status}`;
+            if (statusText) statusText.textContent = message;
+        }
+    }
+
     // ===== MODAL MANAGEMENT =====
     showLogoutModal(session) {
         document.getElementById('logoutUserName').textContent = session.userName;
         this.logoutSession = session;
+
+        // QC-Warnung für Logout anzeigen
+        if (this.qcEnabled && this.qcManager) {
+            const qcSteps = this.qcManager.getActiveQCStepsForSession(session.sessionId);
+            this.showQCWarningInLogoutModal(qcSteps);
+        }
+
         this.showModal('logoutModal');
+    }
+
+    showQCWarningInLogoutModal(qcSteps) {
+        const qcWarning = document.getElementById('logoutQCWarning');
+        const qcList = document.getElementById('logoutQCList');
+
+        if (qcSteps.length > 0) {
+            qcWarning.style.display = 'block';
+            qcList.innerHTML = qcSteps.map(step =>
+                `<li>${this.getShortQRCode(step.qrCode)} (${step.minutesInProgress || 0} Min)</li>`
+            ).join('');
+        } else {
+            qcWarning.style.display = 'none';
+        }
     }
 
     async executeLogout() {
@@ -596,7 +1126,28 @@ class WareneinlagerungApp {
 
         document.getElementById('restartUserName').textContent = session.userName;
         this.restartSession = { userId, sessionId, userName: session.userName };
+
+        // QC-Warnung für Session-Restart anzeigen
+        if (this.qcEnabled && this.qcManager) {
+            const qcSteps = this.qcManager.getActiveQCStepsForSession(sessionId);
+            this.showQCWarningInRestartModal(qcSteps);
+        }
+
         this.showModal('sessionRestartModal');
+    }
+
+    showQCWarningInRestartModal(qcSteps) {
+        const qcWarning = document.getElementById('restartQCWarning');
+        const qcList = document.getElementById('restartQCList');
+
+        if (qcSteps.length > 0) {
+            qcWarning.style.display = 'block';
+            qcList.innerHTML = qcSteps.map(step =>
+                `<li>${this.getShortQRCode(step.qrCode)} (${step.minutesInProgress || 0} Min)</li>`
+            ).join('');
+        } else {
+            qcWarning.style.display = 'none';
+        }
     }
 
     async executeSessionRestart() {
@@ -621,6 +1172,114 @@ class WareneinlagerungApp {
 
         this.hideModal('sessionRestartModal');
         this.restartSession = null;
+    }
+
+    // ===== QC-SPEZIFISCHE MODALS =====
+
+    showQCCompletionModal(data) {
+        const modal = document.getElementById('qcCompletionModal');
+
+        // Modal-Daten füllen
+        document.getElementById('qcCompletionQRCode').textContent = this.getShortQRCode(data.qrCode);
+        document.getElementById('qcCompletionDuration').textContent = data.durationMinutes;
+        document.getElementById('qcCompletionUser').textContent = data.userName || 'Unbekannt';
+
+        // Auto-Session-Reset-Checkbox setzen
+        const autoResetCheckbox = document.getElementById('qcAutoSessionReset');
+        if (autoResetCheckbox) {
+            autoResetCheckbox.checked = this.qcConfig.enableAutoSessionReset;
+        }
+
+        // QC-Completion-Daten speichern
+        this.qcCompletionData = data;
+
+        this.showModal('qcCompletionModal');
+    }
+
+    confirmQCCompletion() {
+        // Rating und Notizen auslesen (falls implementiert)
+        const rating = this.getSelectedQCRating();
+        const notes = document.getElementById('qcNotes')?.value || '';
+        const autoReset = document.getElementById('qcAutoSessionReset')?.checked || false;
+
+        console.log('QC-Abschluss bestätigt:', {
+            rating,
+            notes,
+            autoReset,
+            data: this.qcCompletionData
+        });
+
+        // Hier könnten zusätzliche Backend-Calls für Rating/Notes gemacht werden
+
+        this.hideModal('qcCompletionModal');
+        this.qcCompletionData = null;
+    }
+
+    showQCOverdueModal(data) {
+        const modal = document.getElementById('qcOverdueModal');
+        const details = document.getElementById('qcOverdueDetails');
+
+        if (details) {
+            details.innerHTML = `
+                <div class="qc-overdue-item">
+                    <strong>QR-Code:</strong> ${this.getShortQRCode(data.qrCode)}<br>
+                    <strong>Dauer:</strong> ${data.minutesInProgress} Minuten<br>
+                    <strong>Session:</strong> ${data.sessionId}<br>
+                    <strong>Status:</strong> Überfällig
+                </div>
+            `;
+        }
+
+        this.showModal('qcOverdueModal');
+    }
+
+    setQCRating(rating) {
+        // Alle Sterne zurücksetzen
+        document.querySelectorAll('.qc-star').forEach(star => {
+            star.classList.remove('selected');
+        });
+
+        // Sterne bis zur Bewertung markieren
+        for (let i = 1; i <= rating; i++) {
+            const star = document.querySelector(`[data-rating="${i}"]`);
+            if (star) {
+                star.classList.add('selected');
+            }
+        }
+
+        this.selectedQCRating = rating;
+    }
+
+    getSelectedQCRating() {
+        return this.selectedQCRating || null;
+    }
+
+    toggleQCMode() {
+        if (!this.qcEnabled) return;
+
+        // QC-Modus zwischen 'auto', 'manual', 'disabled' umschalten
+        const modes = ['auto', 'manual', 'disabled'];
+        const currentIndex = modes.indexOf(this.qcMode);
+        this.qcMode = modes[(currentIndex + 1) % modes.length];
+
+        this.updateQCModeToggle();
+        this.showNotification('info', 'QC-Modus', `QC-Modus: ${this.qcMode}`);
+
+        console.log(`🔍 QC-Modus geändert: ${this.qcMode}`);
+    }
+
+    updateQCModeToggle() {
+        const toggle = this.qcUIElements.qcModeToggle;
+        if (toggle) {
+            const modeTexts = {
+                auto: '🔍 Auto',
+                manual: '🔍 Manual',
+                disabled: '🔍 Aus'
+            };
+
+            toggle.textContent = modeTexts[this.qcMode] || '🔍 QC';
+            toggle.className = `btn-qc-toggle ${this.qcMode}`;
+        }
     }
 
     // ===== KAMERA & QR-SCANNER =====
@@ -705,8 +1364,12 @@ class WareneinlagerungApp {
             this.updateScannerUI();
             this.startQRScanLoop();
 
-            this.showNotification('success', 'Scanner bereit',
-                `QR-Codes werden für ${this.selectedSession.userName} erkannt`);
+            let message = `QR-Codes werden für ${this.selectedSession.userName} erkannt`;
+            if (this.qcEnabled) {
+                message += ' (QC-Modus verfügbar)';
+            }
+
+            this.showNotification('success', 'Scanner bereit', message);
 
         } catch (error) {
             console.error('QR-Scanner Start fehlgeschlagen:', error);
@@ -907,7 +1570,7 @@ class WareneinlagerungApp {
         }
     }
 
-    // ===== QR-CODE VERARBEITUNG FÜR PARALLELE SESSIONS =====
+    // ===== QR-CODE VERARBEITUNG FÜR PARALLELE SESSIONS MIT QC =====
     async handleQRCodeDetected(qrData) {
         const now = Date.now();
 
@@ -945,11 +1608,21 @@ class WareneinlagerungApp {
         console.log(`📄 QR-Code erkannt für ${this.selectedSession.userName}:`, qrData);
 
         try {
-            // In Datenbank speichern für ausgewählte Session
+            // In Datenbank speichern für ausgewählte Session (mit QC-Integration)
             const result = await window.electronAPI.qr.saveScan(this.selectedSession.sessionId, qrData);
 
-            // Scan-Ergebnis verarbeiten
-            this.handleScanResult(result, qrData);
+            // QC-spezifische Verarbeitung
+            let qcResult = { qcProcessed: false };
+            if (this.qcEnabled && this.qcManager && result.qualityControl) {
+                qcResult = await this.qcManager.processQRScanForQC(
+                    result,
+                    qrData,
+                    this.selectedSession.sessionId
+                );
+            }
+
+            // Scan-Ergebnis verarbeiten (inklusive QC-Informationen)
+            this.handleScanResult(result, qrData, qcResult);
 
         } catch (error) {
             console.error('QR-Code Verarbeitung fehlgeschlagen:', error);
@@ -963,7 +1636,7 @@ class WareneinlagerungApp {
                 timestamp: new Date().toISOString()
             };
 
-            this.handleScanResult(errorResult, qrData);
+            this.handleScanResult(errorResult, qrData, { qcProcessed: false });
 
         } finally {
             // Verarbeitung abgeschlossen - aus Pending-Set entfernen
@@ -971,11 +1644,18 @@ class WareneinlagerungApp {
         }
     }
 
-    // ===== STRUKTURIERTE SCAN-RESULT-BEHANDLUNG =====
-    handleScanResult(result, qrData) {
-        const { success, status, message, data, duplicateInfo } = result;
+    // ===== STRUKTURIERTE SCAN-RESULT-BEHANDLUNG MIT QC =====
+    handleScanResult(result, qrData, qcResult = { qcProcessed: false }) {
+        const { success, status, message, data, duplicateInfo, qualityControl } = result;
 
-        console.log('QR-Scan Ergebnis:', { success, status, message, session: this.selectedSession.userName });
+        console.log('QR-Scan Ergebnis:', {
+            success,
+            status,
+            message,
+            session: this.selectedSession.userName,
+            qcProcessed: qcResult.qcProcessed,
+            qcAction: qcResult.action
+        });
 
         // Dekodierte Daten extrahieren falls verfügbar
         let decodedData = null;
@@ -985,7 +1665,7 @@ class WareneinlagerungApp {
             decodedData = data.ParsedPayload.decoded;
         }
 
-        // 1. AKTUELLER SCAN: Jeden Scan anzeigen
+        // 1. AKTUELLER SCAN: Jeden Scan anzeigen (mit QC-Informationen)
         this.currentScan = {
             id: data?.ID || `temp_${Date.now()}`,
             timestamp: new Date(),
@@ -997,7 +1677,9 @@ class WareneinlagerungApp {
             message: message,
             success: success,
             duplicateInfo: duplicateInfo,
-            decodedData: decodedData
+            decodedData: decodedData,
+            qualityControl: qualityControl,
+            qcResult: qcResult
         };
 
         this.updateCurrentScanDisplay();
@@ -1018,7 +1700,9 @@ class WareneinlagerungApp {
                     user: this.selectedSession.userName,
                     userId: this.selectedSession.userId,
                     sessionId: this.selectedSession.sessionId,
-                    decodedData: decodedData
+                    decodedData: decodedData,
+                    qualityControl: qualityControl,
+                    qcResult: qcResult
                 });
 
                 // Session-Scan-Count aktualisieren
@@ -1032,12 +1716,12 @@ class WareneinlagerungApp {
             }
         }
 
-        // 3. VISUAL FEEDBACK je nach Status
+        // 3. VISUAL FEEDBACK je nach Status (erweitert für QC)
         if (success) {
             this.globalScannedCodes.add(qrData);
             this.showScanSuccess(qrData, 'success');
 
-            // Erweiterte Nachricht mit dekodierten Daten
+            // Erweiterte Nachricht mit dekodierten Daten und QC-Information
             let enhancedMessage = message;
             if (decodedData) {
                 const parts = [];
@@ -1048,7 +1732,18 @@ class WareneinlagerungApp {
                 }
             }
 
+            // QC-spezifische Nachricht anhängen
+            if (qcResult.qcProcessed && qcResult.message) {
+                enhancedMessage += ` - ${qcResult.message}`;
+            }
+
             this.showNotification('success', 'QR-Code gespeichert', enhancedMessage);
+
+            // Spezielle QC-Behandlung
+            if (qcResult.qcProcessed) {
+                this.handleQCSpecificFeedback(qcResult);
+            }
+
         } else {
             // Verschiedene Fehler/Duplikat-Typen
             switch (status) {
@@ -1084,6 +1779,40 @@ class WareneinlagerungApp {
             new Date().toLocaleTimeString('de-DE');
     }
 
+    handleQCSpecificFeedback(qcResult) {
+        switch (qcResult.action) {
+            case 'qc_started':
+                // QC-UI für laufenden Prozess aktualisieren
+                this.updateQCModeDisplay(true);
+                this.updateQCInfoRow('QC läuft', 'active');
+                break;
+
+            case 'qc_completed':
+                // QC-UI für abgeschlossenen Prozess aktualisieren
+                this.updateQCModeDisplay(false);
+                this.updateQCInfoRow('QC abgeschlossen', 'completed');
+
+                // Wenn Auto-Session-Reset aktiviert, behandeln
+                if (qcResult.autoSessionReset) {
+                    setTimeout(() => {
+                        this.handleSessionAutoReset({
+                            sessionId: this.selectedSession.sessionId,
+                            userId: this.selectedSession.userId,
+                            userName: this.selectedSession.userName,
+                            reason: 'QC abgeschlossen'
+                        });
+                    }, 2000); // 2 Sekunden Verzögerung für Benutzerfeedback
+                }
+                break;
+
+            case 'qc_continued':
+                // QC läuft weiter - UI-Status beibehalten
+                this.updateQCModeDisplay(true);
+                this.updateQCInfoRow('QC läuft weiter', 'active');
+                break;
+        }
+    }
+
     showScanSuccess(qrData, type = 'success') {
         // Visuelles Feedback im Scanner
         const overlay = document.querySelector('.scanner-overlay');
@@ -1104,7 +1833,7 @@ class WareneinlagerungApp {
             overlay.classList.remove(feedbackClass);
         }, 1000);
 
-        // Audio-Feedback
+        // Audio-Feedback (erweitert für QC)
         this.playSuccessSound(type);
     }
 
@@ -1156,13 +1885,14 @@ class WareneinlagerungApp {
         }
     }
 
-    // ===== CURRENT SCAN DISPLAY =====
+    // ===== CURRENT SCAN DISPLAY MIT QC =====
     updateCurrentScanDisplay() {
         const currentScanDisplay = document.getElementById('currentScanDisplay');
         const currentScanTime = document.getElementById('currentScanTime');
         const currentScanStatus = document.getElementById('currentScanStatus');
         const currentScanContent = document.getElementById('currentScanContent');
         const currentScanMessage = document.getElementById('currentScanMessage');
+        const currentScanQCInfo = document.getElementById('currentScanQCInfo');
 
         if (!this.currentScan) {
             currentScanDisplay.style.display = 'none';
@@ -1191,9 +1921,59 @@ class WareneinlagerungApp {
         currentScanContent.textContent = contentPreview;
 
         currentScanMessage.textContent = scan.message;
+
+        // QC-spezifische Informationen anzeigen
+        if (this.qcEnabled && scan.qcResult && scan.qcResult.qcProcessed) {
+            this.updateCurrentScanQCInfo(scan, currentScanQCInfo);
+        } else {
+            currentScanQCInfo.style.display = 'none';
+        }
     }
 
-    // ===== SUCCESSFUL SCANS TABLE =====
+    updateCurrentScanQCInfo(scan, qcInfoElement) {
+        const qcResult = scan.qcResult;
+
+        if (!qcResult || !qcResult.qcProcessed) {
+            qcInfoElement.style.display = 'none';
+            return;
+        }
+
+        qcInfoElement.style.display = 'block';
+
+        const qcStepLabel = document.getElementById('qcStepLabel');
+        const qcStepValue = document.getElementById('qcStepValue');
+        const qcDurationValue = document.getElementById('qcDurationValue');
+        const qcNextStep = document.getElementById('qcNextStep');
+
+        switch (qcResult.action) {
+            case 'qc_started':
+                qcStepValue.textContent = '1/2 (Eingang)';
+                qcDurationValue.textContent = '0 Min';
+                qcNextStep.textContent = 'Scannen Sie den gleichen QR-Code erneut für Ausgang';
+                qcInfoElement.className = 'current-scan-qc-info qc-started';
+                break;
+
+            case 'qc_completed':
+                qcStepValue.textContent = '2/2 (Ausgang)';
+                qcDurationValue.textContent = `${qcResult.durationMinutes || 0} Min`;
+                qcNextStep.textContent = 'Qualitätsprüfung abgeschlossen';
+                qcInfoElement.className = 'current-scan-qc-info qc-completed';
+                break;
+
+            case 'qc_continued':
+                qcStepValue.textContent = '1/2 (läuft)';
+                qcDurationValue.textContent = `${qcResult.minutesInProgress || 0} Min`;
+                qcNextStep.textContent = 'QC läuft bereits - scannen Sie erneut für Ausgang';
+                qcInfoElement.className = 'current-scan-qc-info qc-continued';
+                break;
+
+            default:
+                qcInfoElement.style.display = 'none';
+                break;
+        }
+    }
+
+    // ===== SUCCESSFUL SCANS TABLE MIT QC =====
     addToSuccessfulScans(scan) {
         this.successfulScans.unshift(scan);
 
@@ -1223,6 +2003,25 @@ class WareneinlagerungApp {
             const timeString = scan.timestamp.toLocaleTimeString('de-DE');
             const decoded = scan.decodedData || {};
 
+            // QC-Status für diese Zeile
+            let qcStatus = '-';
+            if (this.qcEnabled && scan.qcResult && scan.qcResult.qcProcessed) {
+                switch (scan.qcResult.action) {
+                    case 'qc_started':
+                        qcStatus = '🔍 Laufend';
+                        break;
+                    case 'qc_completed':
+                        qcStatus = `✅ ${scan.qcResult.durationMinutes}M`;
+                        break;
+                    case 'qc_continued':
+                        qcStatus = '🔄 Fortsetzung';
+                        break;
+                    default:
+                        qcStatus = '❓ Unbekannt';
+                        break;
+                }
+            }
+
             return `
                 <tr>
                     <td class="scan-time-col">${timeString}</td>
@@ -1230,6 +2029,7 @@ class WareneinlagerungApp {
                     <td class="auftrag-col">${decoded.auftrags_nr || '-'}</td>
                     <td class="kunde-col">${decoded.kunden_name || decoded.kunden_id || '-'}</td>
                     <td class="paket-col">${decoded.paket_nr || '-'}</td>
+                    ${this.qcEnabled ? `<td class="qc-col">${qcStatus}</td>` : ''}
                 </tr>
             `;
         }).join('');
@@ -1254,7 +2054,8 @@ class WareneinlagerungApp {
                     user: this.selectedSession.userName,
                     userId: this.selectedSession.userId,
                     sessionId: this.selectedSession.sessionId,
-                    decodedData: scan.DecodedData
+                    decodedData: scan.DecodedData,
+                    qualityControl: scan.QualityControl || null
                 });
             });
 
@@ -1267,7 +2068,13 @@ class WareneinlagerungApp {
     async refreshScans() {
         if (this.selectedSession) {
             await this.refreshScansForSelectedUser();
-            this.showNotification('info', 'Aktualisiert', 'Scan-Historie wurde aktualisiert');
+
+            // QC-Daten auch aktualisieren
+            if (this.qcEnabled && this.qcManager) {
+                await this.qcManager.refreshQCData();
+            }
+
+            this.showNotification('info', 'Aktualisiert', 'Scan-Historie und QC-Daten wurden aktualisiert');
         }
     }
 
@@ -1290,9 +2097,36 @@ class WareneinlagerungApp {
     }
 
     getScanStatusInfo(scan) {
-        const { success, status, duplicateInfo } = scan;
+        const { success, status, duplicateInfo, qcResult } = scan;
 
         if (success) {
+            // QC-spezifische Erfolgs-Anzeige
+            if (qcResult && qcResult.qcProcessed) {
+                switch (qcResult.action) {
+                    case 'qc_started':
+                        return {
+                            cssClass: 'scan-qc-started',
+                            icon: '🔍',
+                            label: 'QC gestartet',
+                            color: '#3b82f6'
+                        };
+                    case 'qc_completed':
+                        return {
+                            cssClass: 'scan-qc-completed',
+                            icon: '✅',
+                            label: 'QC abgeschlossen',
+                            color: '#28a745'
+                        };
+                    case 'qc_continued':
+                        return {
+                            cssClass: 'scan-qc-continued',
+                            icon: '🔄',
+                            label: 'QC läuft',
+                            color: '#17a2b8'
+                        };
+                }
+            }
+
             return {
                 cssClass: 'scan-success',
                 icon: '✅',
@@ -1350,6 +2184,22 @@ class WareneinlagerungApp {
     }
 
     // ===== UTILITY METHODS =====
+
+    getShortQRCode(qrCode) {
+        if (!qrCode) return '';
+
+        // Zeige nur die letzten 8 Zeichen oder eine intelligent gekürzte Version
+        if (qrCode.length <= 12) return qrCode;
+
+        // Versuche strukturierte Daten zu erkennen
+        if (qrCode.includes('^')) {
+            const parts = qrCode.split('^');
+            return parts.length > 3 ? `${parts[1]}...${parts[3]}` : qrCode.substring(0, 12) + '...';
+        }
+
+        return qrCode.substring(0, 8) + '...' + qrCode.substring(qrCode.length - 4);
+    }
+
     cleanupOldScans() {
         // Bereinige alte Einträge aus recentlyScanned (älter als 1 Minute)
         const now = Date.now();
@@ -1481,18 +2331,71 @@ class WareneinlagerungApp {
         const modal = document.getElementById(modalId);
         modal.classList.remove('show');
     }
+
+    // ===== PUBLIC API FOR QC MANAGER =====
+
+    /**
+     * Ermöglicht dem QC Manager den Zugriff auf Event-System
+     */
+    on(event, handler) {
+        // Einfaches Event-System für QC Manager
+        if (!this.eventHandlers) {
+            this.eventHandlers = new Map();
+        }
+
+        if (!this.eventHandlers.has(event)) {
+            this.eventHandlers.set(event, new Set());
+        }
+
+        this.eventHandlers.get(event).add(handler);
+    }
+
+    off(event, handler) {
+        if (this.eventHandlers && this.eventHandlers.has(event)) {
+            this.eventHandlers.get(event).delete(handler);
+        }
+    }
+
+    emit(event, data) {
+        if (this.eventHandlers && this.eventHandlers.has(event)) {
+            this.eventHandlers.get(event).forEach(handler => {
+                try {
+                    handler(data);
+                } catch (error) {
+                    console.error(`Fehler in Event-Handler für ${event}:`, error);
+                }
+            });
+        }
+    }
+
+    /**
+     * Cleanup-Methode für QC-System
+     */
+    cleanup() {
+        if (this.qcManager) {
+            this.qcManager.cleanup();
+        }
+
+        // Event-Handler bereinigen
+        if (this.eventHandlers) {
+            this.eventHandlers.clear();
+        }
+    }
 }
 
 // ===== APP INITIALIZATION =====
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('🏁 DOM geladen, starte Wareneinlagerung-App...');
+    console.log('🏁 DOM geladen, starte Wareneinlagerung-App mit QC...');
     window.wareneinlagerungApp = new WareneinlagerungApp();
 });
 
 // Cleanup beim Fenster schließen
 window.addEventListener('beforeunload', () => {
-    if (window.wareneinlagerungApp && window.wareneinlagerungApp.scannerActive) {
-        window.wareneinlagerungApp.stopQRScanner();
+    if (window.wareneinlagerungApp) {
+        if (window.wareneinlagerungApp.scannerActive) {
+            window.wareneinlagerungApp.stopQRScanner();
+        }
+        window.wareneinlagerungApp.cleanup();
     }
 });
 
@@ -1513,6 +2416,26 @@ window.app = {
     restartSession: (userId, sessionId) => {
         if (window.wareneinlagerungApp) {
             window.wareneinlagerungApp.showSessionRestartModal(userId, sessionId);
+        }
+    },
+
+    // QC-spezifische Funktionen
+    toggleQCMode: () => {
+        if (window.wareneinlagerungApp && window.wareneinlagerungApp.qcEnabled) {
+            window.wareneinlagerungApp.toggleQCMode();
+        }
+    },
+
+    getQCStatus: (qrCode) => {
+        if (window.wareneinlagerungApp && window.wareneinlagerungApp.qcManager) {
+            return window.wareneinlagerungApp.qcManager.getQCStatus(qrCode);
+        }
+        return null;
+    },
+
+    refreshQCData: () => {
+        if (window.wareneinlagerungApp && window.wareneinlagerungApp.qcManager) {
+            return window.wareneinlagerungApp.qcManager.refreshQCData();
         }
     }
 };
