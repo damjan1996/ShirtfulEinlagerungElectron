@@ -187,9 +187,10 @@ class DatabaseClient {
      * Erstellt eine neue Session für Wareneinlagerung
      * @param {number} userId - Benutzer ID
      * @param {string} sessionType - Session-Typ (default: 'Wareneinlagerung')
+     * @param {boolean} closeExistingSessions - Bestehende Sessions beenden (default: true)
      * @returns {Object} - Session-Daten
      */
-    async createSession(userId, sessionType = 'Wareneinlagerung') {
+    async createSession(userId, sessionType = 'Wareneinlagerung', closeExistingSessions = true) {
         if (!this.sessions) throw new Error('DatabaseClient nicht verbunden');
 
         // Prüfe ob SessionTypes initialisiert sind
@@ -202,7 +203,7 @@ class DatabaseClient {
             }
         }
 
-        return await this.sessions.createSession(userId, sessionType);
+        return await this.sessions.createSession(userId, sessionType, closeExistingSessions);
     }
 
     /**
@@ -222,9 +223,9 @@ class DatabaseClient {
             } else {
                 // Ohne Benutzer-Validierung (legacy support)
                 const result = await this.query(`
-                    UPDATE Sessions 
+                    UPDATE Sessions
                     SET StartTS = GETDATE()
-                    OUTPUT INSERTED.ID, INSERTED.UserID, INSERTED.StartTS, INSERTED.Active
+                        OUTPUT INSERTED.ID, INSERTED.UserID, INSERTED.StartTS, INSERTED.Active
                     WHERE ID = ? AND Active = 1
                 `, [sessionId]);
 

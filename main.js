@@ -362,13 +362,14 @@ class WareneinlagerungMainApp {
     }
 
     /**
-     * NEUE HILFSFUNKTION: Session mit Fallback erstellen
+     * KORRIGIERTE HILFSFUNKTION: Session mit Fallback erstellen
      * Versucht verschiedene SessionTypes in Prioritätsreihenfolge
      * @param {number} userId - Benutzer ID
      * @param {Array} sessionTypePriority - Prioritätsliste der SessionTypes (optional)
+     * @param {boolean} closeExistingSessions - Bestehende Sessions beenden (default: true)
      * @returns {Object} - { session, sessionTypeName, fallbackUsed }
      */
-    async createSessionWithFallback(userId, sessionTypePriority = null) {
+    async createSessionWithFallback(userId, sessionTypePriority = null, closeExistingSessions = true) {
         const typesToTry = sessionTypePriority || this.sessionTypePriority;
 
         if (typesToTry.length === 0) {
@@ -379,8 +380,10 @@ class WareneinlagerungMainApp {
 
         for (const sessionType of typesToTry) {
             try {
-                console.log(`🔄 Versuche SessionType: ${sessionType}`);
-                const session = await this.dbClient.createSession(userId, sessionType);
+                console.log(`🔄 Versuche SessionType: ${sessionType} (closeExisting: ${closeExistingSessions})`);
+
+                // ===== KRITISCH: closeExistingSessions Parameter übergeben =====
+                const session = await this.dbClient.createSession(userId, sessionType, closeExistingSessions);
 
                 if (session) {
                     const fallbackUsed = sessionType !== typesToTry[0];
@@ -513,7 +516,7 @@ class WareneinlagerungMainApp {
 
                 // Session in Datenbank neu starten (StartTime aktualisieren)
                 await this.dbClient.query(`
-                    UPDATE Sessions 
+                    UPDATE Sessions
                     SET StartTS = GETDATE()
                     WHERE ID = ? AND UserID = ? AND Active = 1
                 `, [sessionId, userId]);
@@ -705,7 +708,7 @@ class WareneinlagerungMainApp {
                 features: {
                     qrDecoding: true,
                     parallelSessions: true,
-                    sessionRestart: true,
+                    sessionEnd: true, // GEÄNDERT: von sessionRestart zu sessionEnd
                     sessionTypeFallback: true,
                     sessionTypesSetup: this.systemStatus.sessionTypesSetup,
                     decodingFormats: ['caret_separated', 'pattern_matching', 'structured_data'],
@@ -801,7 +804,7 @@ class WareneinlagerungMainApp {
         }
     }
 
-    // ===== VERBESSERTE RFID-VERARBEITUNG MIT FALLBACK =====
+    // ===== VERBESSERTE RFID-VERARBEITUNG: SESSION ENDE + NEUE SESSION =====
     async handleRFIDScan(tagId) {
         const now = Date.now();
 
@@ -837,116 +840,137 @@ class WareneinlagerungMainApp {
             const existingSession = this.activeSessions.get(user.ID);
 
             if (existingSession) {
-                // ===== SESSION-RESTART: Timer zurücksetzen =====
-                console.log(`🔄 Session-Restart für ${user.BenutzerName} (Session ${existingSession.sessionId})`);
+                // ===== NEUE LOGIK: SESSION BEENDEN + NEUE SESSION STARTEN =====
+                console.log(`📝 Beende aktuelle Session für ${user.BenutzerName} (Session ${existingSession.sessionId})`);
 
-                // Session in Datenbank neu starten
-                const restartSuccess = await this.dbClient.query(`
+                // 1. Aktuelle Session in Datenbank beenden
+                const endSuccess = await this.dbClient.query(`
                     UPDATE Sessions
-                    SET StartTS = GETDATE()
+                    SET EndTS = SYSDATETIME(), Active = 0
                     WHERE ID = ? AND UserID = ? AND Active = 1
                 `, [existingSession.sessionId, user.ID]);
 
-                if (restartSuccess) {
-                    // Lokale Session-Daten aktualisieren
-                    existingSession.startTime = new Date();
-                    existingSession.lastActivity = new Date();
+                if (endSuccess) {
+                    // 2. Arbeitszeit berechnen
+                    const duration = Date.now() - existingSession.startTime.getTime();
 
-                    // Session-Timer neu starten
+                    // 3. Session-Timer stoppen
                     this.stopSessionTimer(existingSession.sessionId);
-                    this.startSessionTimer(existingSession.sessionId, user.ID);
 
-                    // Session-Restart-Event senden
-                    this.sendToRenderer('session-restarted', {
+                    // 4. Session aus lokaler Verwaltung entfernen
+                    this.activeSessions.delete(user.ID);
+
+                    // 5. Rate Limit für Session zurücksetzen
+                    this.qrScanRateLimit.delete(existingSession.sessionId);
+
+                    // 6. Frontend über Session-Ende informieren
+                    this.sendToRenderer('session-ended', {
                         user,
                         sessionId: existingSession.sessionId,
                         sessionType: existingSession.sessionType || 'Unbekannt',
-                        newStartTime: existingSession.startTime.toISOString(),
-                        timestamp: new Date().toISOString(),
+                        endTime: new Date().toISOString(),
+                        duration: duration,
                         source: 'rfid_scan'
                     });
 
-                    console.log(`✅ Session erfolgreich neu gestartet für ${user.BenutzerName}`);
+                    console.log(`✅ Session ${existingSession.sessionId} erfolgreich beendet (Dauer: ${Math.round(duration / 1000)}s)`);
+
+                    // 7. Sofort neue Session erstellen
+                    await this.createNewSessionForUser(user);
                 } else {
                     this.sendToRenderer('rfid-scan-error', {
                         tagId,
-                        message: 'Fehler beim Session-Restart',
+                        message: 'Fehler beim Beenden der aktuellen Session',
                         timestamp: new Date().toISOString()
                     });
                 }
 
             } else {
-                // ===== NEUE SESSION ERSTELLEN MIT FALLBACK =====
-                console.log(`🔑 Neue Session für ${user.BenutzerName}...`);
-
-                try {
-                    const { session, sessionTypeName, fallbackUsed } = await this.createSessionWithFallback(user.ID);
-
-                    if (session) {
-                        // Lokale Session-Daten setzen
-                        this.activeSessions.set(user.ID, {
-                            sessionId: session.ID,
-                            userId: user.ID,
-                            startTime: session.StartTS,
-                            lastActivity: new Date(),
-                            sessionType: sessionTypeName
-                        });
-
-                        // Session-Timer starten
-                        this.startSessionTimer(session.ID, user.ID);
-
-                        // Rate Limit für neue Session initialisieren
-                        this.qrScanRateLimit.set(session.ID, []);
-
-                        // Session-Daten mit normalisiertem Zeitstempel senden
-                        const normalizedSession = {
-                            ...session,
-                            StartTS: this.normalizeTimestamp(session.StartTS)
-                        };
-
-                        // Login-Event senden
-                        this.sendToRenderer('user-login', {
-                            user,
-                            session: normalizedSession,
-                            sessionType: sessionTypeName,
-                            fallbackUsed: fallbackUsed,
-                            timestamp: new Date().toISOString(),
-                            source: 'rfid_scan',
-                            isNewSession: true
-                        });
-
-                        console.log(`✅ Neue Session erstellt für ${user.BenutzerName} (Session ${session.ID}, Type: ${sessionTypeName})`);
-
-                        if (fallbackUsed) {
-                            console.warn(`⚠️ Fallback SessionType '${sessionTypeName}' verwendet - primärer SessionType nicht verfügbar`);
-
-                            // Warnung an Renderer senden
-                            this.sendToRenderer('session-fallback-warning', {
-                                user,
-                                sessionType: sessionTypeName,
-                                primaryType: this.sessionTypePriority[0],
-                                message: `Fallback SessionType '${sessionTypeName}' verwendet`,
-                                timestamp: new Date().toISOString()
-                            });
-                        }
-                    }
-                } catch (sessionError) {
-                    console.error(`❌ Konnte keine Session erstellen für ${user.BenutzerName}:`, sessionError.message);
-
-                    this.sendToRenderer('rfid-scan-error', {
-                        tagId,
-                        message: `Keine verfügbaren SessionTypes: ${sessionError.message}`,
-                        timestamp: new Date().toISOString(),
-                        critical: true
-                    });
-                }
+                // ===== ERSTE ANMELDUNG: NEUE SESSION ERSTELLEN =====
+                console.log(`🔑 Erste Anmeldung für ${user.BenutzerName}...`);
+                await this.createNewSessionForUser(user);
             }
 
         } catch (error) {
-            console.error('RFID-Verarbeitungs-Fehler:', error);
+            console.error('RFID-Verarbeitung Fehler:', error);
             this.sendToRenderer('rfid-scan-error', {
                 tagId,
                 message: error.message,
+                timestamp: new Date().toISOString()
+            });
+        }
+    }
+
+    // ===== KORRIGIERTE HILFSFUNKTION: SESSION ERSTELLEN OHNE BESTEHENDE ZU BEENDEN =====
+    async createNewSessionForUser(user) {
+        try {
+            console.log(`🆕 Erstelle neue Session für ${user.BenutzerName}...`);
+
+            // ===== KRITISCH: closeExistingSessions = false =====
+            // Da wir die Session bereits manuell beendet haben
+            const { session, sessionTypeName, fallbackUsed } = await this.createSessionWithFallback(
+                user.ID,
+                null,           // sessionTypePriority default
+                false           // closeExistingSessions = false !!!
+            );
+
+            if (session) {
+                // Lokale Session-Daten setzen
+                this.activeSessions.set(user.ID, {
+                    sessionId: session.ID,
+                    userId: user.ID,
+                    startTime: new Date(session.StartTS),
+                    lastActivity: new Date(),
+                    sessionType: sessionTypeName
+                });
+
+                // Session-Timer starten (beginnt bei 0)
+                this.startSessionTimer(session.ID, user.ID);
+
+                // Rate Limit für neue Session initialisieren
+                this.qrScanRateLimit.set(session.ID, []);
+
+                // Session-Daten mit normalisiertem Zeitstempel senden
+                const normalizedSession = {
+                    ...session,
+                    StartTS: this.normalizeTimestamp(session.StartTS)
+                };
+
+                // Login-Event senden
+                this.sendToRenderer('user-login', {
+                    user,
+                    session: normalizedSession,
+                    sessionType: sessionTypeName,
+                    fallbackUsed: fallbackUsed,
+                    timestamp: new Date().toISOString(),
+                    source: 'rfid_scan',
+                    isNewSession: true
+                });
+
+                console.log(`✅ Neue Session erstellt für ${user.BenutzerName} (Session ${session.ID}, Type: ${sessionTypeName})`);
+
+                if (fallbackUsed) {
+                    console.warn(`⚠️ Fallback SessionType '${sessionTypeName}' verwendet`);
+
+                    // Warnung an Renderer senden
+                    this.sendToRenderer('session-fallback-warning', {
+                        user,
+                        sessionType: sessionTypeName,
+                        primaryType: this.sessionTypePriority[0],
+                        message: `Fallback SessionType '${sessionTypeName}' verwendet`,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+
+            } else {
+                throw new Error('Session konnte nicht erstellt werden');
+            }
+
+        } catch (error) {
+            console.error('Neue Session Fehler:', error);
+            this.sendToRenderer('rfid-scan-error', {
+                tagId: 'unknown',
+                message: `Fehler beim Erstellen einer neuen Session: ${error.message}`,
                 timestamp: new Date().toISOString()
             });
         }

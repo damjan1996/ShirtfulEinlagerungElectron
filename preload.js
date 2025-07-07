@@ -59,7 +59,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
             'system-error',
             'user-login',           // Neuer Benutzer loggt sich ein
             'user-logout',          // Benutzer loggt sich aus
-            'session-restarted',    // Session wurde neu gestartet (RFID-Rescan)
+            'session-ended',        // NEU: Session wurde beendet (RFID-Rescan)
+            'session-restarted',    // Session wurde neu gestartet (DEPRECATED)
             'session-timer-update', // Timer-Updates für Sessions
             'rfid-scan-error',
             'qr-scan-detected',
@@ -82,6 +83,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
             'system-error',
             'user-login',
             'user-logout',
+            'session-ended',        // NEU: Session wurde beendet
             'session-restarted',
             'session-timer-update',
             'rfid-scan-error',

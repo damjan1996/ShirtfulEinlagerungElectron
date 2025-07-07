@@ -164,9 +164,15 @@ class WareneinlagerungApp {
             this.handleUserLogout(data.user, data);
         });
 
-        // Session neu gestartet (RFID-Rescan)
+        // ===== NEUER EVENT-HANDLER: SESSION-ENDED =====
+        window.electronAPI.on('session-ended', (data) => {
+            console.log('Session beendet:', data);
+            this.handleSessionEnded(data);
+        });
+
+        // Session neu gestartet (RFID-Rescan) - DEPRECATED, wird durch session-ended + user-login ersetzt
         window.electronAPI.on('session-restarted', (data) => {
-            console.log('Session neu gestartet:', data);
+            console.log('Session neu gestartet (deprecated):', data);
             this.handleSessionRestarted(data);
         });
 
@@ -245,6 +251,51 @@ class WareneinlagerungApp {
         this.updateWorkspaceVisibility();
 
         this.showNotification('info', 'Abgemeldet', `${user.BenutzerName} wurde abgemeldet`);
+    }
+
+    // ===== NEUER EVENT-HANDLER: SESSION ENDED =====
+    async handleSessionEnded(data) {
+        console.log(`📝 Session beendet für ${data.user.BenutzerName}: ${Math.round(data.duration / 1000)}s`);
+
+        // Session aus lokaler Verwaltung entfernen
+        this.activeSessions.delete(data.user.ID);
+
+        // Session-Timer stoppen
+        this.stopSessionTimer(data.user.ID);
+
+        // Session-spezifische QR-Codes entfernen
+        this.sessionScannedCodes.delete(data.sessionId);
+
+        // Falls ausgewählte Session, Auswahl zurücksetzen
+        if (this.selectedSession && this.selectedSession.userId === data.user.ID) {
+            this.selectedSession = null;
+            this.updateSelectedUserDisplay();
+            this.updateScannerInfo();
+        }
+
+        // UI aktualisieren
+        this.updateActiveUsersDisplay();
+        this.updateWorkspaceVisibility();
+
+        // Benachrichtigung anzeigen
+        const durationText = this.formatDuration(data.duration);
+        this.showNotification('info', 'Session beendet',
+            `${data.user.BenutzerName}: ${durationText} gearbeitet`);
+    }
+
+    formatDuration(milliseconds) {
+        const seconds = Math.floor(milliseconds / 1000);
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const remainingSeconds = seconds % 60;
+
+        if (hours > 0) {
+            return `${hours}h ${minutes}m ${remainingSeconds}s`;
+        } else if (minutes > 0) {
+            return `${minutes}m ${remainingSeconds}s`;
+        } else {
+            return `${remainingSeconds}s`;
+        }
     }
 
     async handleSessionRestarted(data) {
