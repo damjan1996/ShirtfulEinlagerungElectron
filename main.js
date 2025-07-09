@@ -70,17 +70,47 @@ class WareneinlagerungMainApp {
     }
 
     initializeApp() {
-        // Hardware-Beschleunigung für bessere Kompatibilität anpassen
+        // ===== ERWEITERTE HARDWARE-BESCHLEUNIGUNG ANPASSUNGEN =====
+
+        // Basis GPU-Fixes
         app.commandLine.appendSwitch('--disable-gpu-process-crash-limit');
         app.commandLine.appendSwitch('--disable-gpu-sandbox');
         app.commandLine.appendSwitch('--disable-software-rasterizer');
         app.commandLine.appendSwitch('--disable-features', 'VizDisplayCompositor');
 
-        // Für Windows: GPU-Probleme vermeiden
+        // ===== ERWEITERTE FIXES FÜR GPU-CONTEXT-PROBLEME =====
+
+        // WebGL und GPU-Context Probleme beheben
+        app.commandLine.appendSwitch('--disable-gl-error-limit');
+        app.commandLine.appendSwitch('--disable-gl-extensions');
+        app.commandLine.appendSwitch('--disable-accelerated-video-decode');
+        app.commandLine.appendSwitch('--disable-accelerated-video-encode');
+
+        // GPU-Process Abstürze verhindern
+        app.commandLine.appendSwitch('--disable-gpu-memory-buffer-video-frames');
+        app.commandLine.appendSwitch('--disable-gpu-memory-buffer-compositor-resources');
+
+        // Virtualisierung und Shared Context Probleme
+        app.commandLine.appendSwitch('--disable-shared-gpu');
+        app.commandLine.appendSwitch('--disable-gpu-process-for-dx12-vulkan-info-collection');
+
+        // Für Windows: Umfassende GPU-Probleme vermeiden
         if (process.platform === 'win32') {
             app.commandLine.appendSwitch('--disable-gpu');
             app.commandLine.appendSwitch('--disable-gpu-compositing');
+
+            // ===== ZUSÄTZLICHE WINDOWS-SPEZIFISCHE FIXES =====
+            app.commandLine.appendSwitch('--disable-d3d11');
+            app.commandLine.appendSwitch('--disable-angle-d3d11');
+            app.commandLine.appendSwitch('--force-cpu-draw');
+            app.commandLine.appendSwitch('--disable-direct-composition');
+
+            // Falls Hardware-Alt ist
+            app.commandLine.appendSwitch('--disable-features', 'VizDisplayCompositor,VizHitTestSurfaceLayer');
+            app.commandLine.appendSwitch('--use-gl', 'swiftshader'); // Software-Renderer erzwingen
         }
+
+        console.log('🔧 GPU-Optimierungen angewendet');
 
         // App bereit
         app.whenReady().then(() => {
@@ -125,16 +155,28 @@ class WareneinlagerungMainApp {
                 preload: path.join(__dirname, 'preload.js'),
                 enableRemoteModule: false,
                 webSecurity: true,
+
+                // ===== ZUSÄTZLICHE WEBPREFERENCES FÜR GPU-STABILITÄT =====
+                hardwareAcceleration: false,  // Hardware-Beschleunigung deaktivieren
+                webgl: false,                  // WebGL deaktivieren wenn nicht benötigt
+                experimentalFeatures: false,   // Experimentelle Features deaktivieren
+
                 // GPU-Problem-Workarounds
                 disableBlinkFeatures: 'Accelerated2dCanvas,AcceleratedSmallCanvases',
                 enableBlinkFeatures: '',
-                hardwareAcceleration: false
+
+                // Sicherheit
+                allowRunningInsecureContent: false,
+                safeDialogs: true
             },
-            show: false,
+
+            // ===== WINDOW-SPEZIFISCHE GPU-OPTIMIERUNGEN =====
+            show: false, // Erst nach ready anzeigen
             title: 'RFID Wareneinlagerung - Shirtful',
             autoHideMenuBar: true,
             frame: true,
             titleBarStyle: 'default',
+
             // Windows-spezifische Optionen
             ...(process.platform === 'win32' && {
                 icon: path.join(__dirname, 'assets/icon.ico')
@@ -144,9 +186,10 @@ class WareneinlagerungMainApp {
         // Renderer laden
         this.mainWindow.loadFile('renderer/index.html');
 
-        // Fenster anzeigen wenn bereit
+        // Window erst nach vollständiger Initialisierung anzeigen
         this.mainWindow.once('ready-to-show', () => {
             this.mainWindow.show();
+            console.log('✅ Hauptfenster erfolgreich geladen (GPU-optimiert)');
 
             // Development Tools
             if (process.env.NODE_ENV === 'development' || process.argv.includes('--dev')) {
@@ -508,35 +551,55 @@ class WareneinlagerungMainApp {
             }
         });
 
+        // ===== KORRIGIERTER SESSION-RESTART HANDLER =====
         ipcMain.handle('session-restart', async (event, sessionId, userId) => {
             try {
-                if (!this.dbClient || !this.systemStatus.database) {
-                    return false;
+                console.log(`🔄 Session-Restart Request für Session ${sessionId}, User ${userId}`);
+
+                // 1. Aktuelle Session beenden
+                const endSuccess = await this.dbClient.endSession(sessionId);
+
+                if (endSuccess) {
+                    // 2. Lokale Session-Daten entfernen
+                    this.activeSessions.delete(userId);
+                    this.stopSessionTimer(sessionId);
+                    this.qrScanRateLimit.delete(sessionId);
+
+                    // 3. Neue Session erstellen
+                    const { session, sessionTypeName, fallbackUsed } = await this.createSessionWithFallback(userId, null, false);
+
+                    if (session) {
+                        // 4. Lokale Session-Daten setzen
+                        this.activeSessions.set(userId, {
+                            sessionId: session.ID,
+                            userId: userId,
+                            startTime: new Date(session.StartTS),
+                            lastActivity: new Date(),
+                            sessionType: sessionTypeName
+                        });
+
+                        // 5. Session-Timer starten
+                        this.startSessionTimer(session.ID, userId);
+                        this.qrScanRateLimit.set(session.ID, []);
+
+                        console.log(`✅ Session-Restart erfolgreich: Alte Session ${sessionId} → Neue Session ${session.ID}`);
+
+                        // 6. Restart-Event senden
+                        this.sendToRenderer('session-restarted', {
+                            oldSessionId: sessionId,
+                            newSessionId: session.ID,
+                            userId: userId,
+                            sessionType: sessionTypeName,
+                            timestamp: new Date().toISOString()
+                        });
+
+                        return true;
+                    }
                 }
 
-                // Session in Datenbank neu starten (StartTime aktualisieren)
-                await this.dbClient.query(`
-                    UPDATE Sessions
-                    SET StartTS = GETDATE()
-                    WHERE ID = ? AND UserID = ? AND Active = 1
-                `, [sessionId, userId]);
-
-                // Lokale Session-Daten aktualisieren
-                const localSession = this.activeSessions.get(userId);
-                if (localSession) {
-                    localSession.startTime = new Date();
-                    localSession.lastActivity = new Date();
-                }
-
-                // Session-Timer neu starten
-                this.stopSessionTimer(sessionId);
-                this.startSessionTimer(sessionId, userId);
-
-                console.log(`Session ${sessionId} für Benutzer ${userId} neu gestartet`);
-                return true;
-
+                return false;
             } catch (error) {
-                console.error('Session Restart Fehler:', error);
+                console.error('Session-Restart Fehler:', error);
                 return false;
             }
         });
@@ -708,7 +771,8 @@ class WareneinlagerungMainApp {
                 features: {
                     qrDecoding: true,
                     parallelSessions: true,
-                    sessionEnd: true, // GEÄNDERT: von sessionRestart zu sessionEnd
+                    sessionEnd: true,
+                    sessionRestart: true, // Session-Restart als Session-Ende + Neue Session
                     sessionTypeFallback: true,
                     sessionTypesSetup: this.systemStatus.sessionTypesSetup,
                     decodingFormats: ['caret_separated', 'pattern_matching', 'structured_data'],
@@ -804,7 +868,7 @@ class WareneinlagerungMainApp {
         }
     }
 
-    // ===== VERBESSERTE RFID-VERARBEITUNG: SESSION ENDE + NEUE SESSION =====
+    // ===== KORRIGIERTE RFID-VERARBEITUNG: SESSION BEENDEN + NEUE SESSION =====
     async handleRFIDScan(tagId) {
         const now = Date.now();
 
@@ -840,17 +904,17 @@ class WareneinlagerungMainApp {
             const existingSession = this.activeSessions.get(user.ID);
 
             if (existingSession) {
-                // ===== NEUE LOGIK: SESSION BEENDEN + NEUE SESSION STARTEN =====
+                // ===== KORRIGIERTE LOGIK: SESSION BEENDEN + NEUE SESSION STARTEN =====
                 console.log(`📝 Beende aktuelle Session für ${user.BenutzerName} (Session ${existingSession.sessionId})`);
 
-                // 1. Aktuelle Session in Datenbank beenden
-                const endSuccess = await this.dbClient.query(`
+                // 1. Aktuelle Session in Datenbank korrekt beenden
+                const endResult = await this.dbClient.query(`
                     UPDATE Sessions
                     SET EndTS = SYSDATETIME(), Active = 0
                     WHERE ID = ? AND UserID = ? AND Active = 1
                 `, [existingSession.sessionId, user.ID]);
 
-                if (endSuccess) {
+                if (endResult && endResult.rowsAffected && endResult.rowsAffected[0] > 0) {
                     // 2. Arbeitszeit berechnen
                     const duration = Date.now() - existingSession.startTime.getTime();
 
@@ -870,7 +934,8 @@ class WareneinlagerungMainApp {
                         sessionType: existingSession.sessionType || 'Unbekannt',
                         endTime: new Date().toISOString(),
                         duration: duration,
-                        source: 'rfid_scan'
+                        source: 'rfid_scan',
+                        durationFormatted: this.formatDuration(duration)
                     });
 
                     console.log(`✅ Session ${existingSession.sessionId} erfolgreich beendet (Dauer: ${Math.round(duration / 1000)}s)`);
@@ -878,6 +943,7 @@ class WareneinlagerungMainApp {
                     // 7. Sofort neue Session erstellen
                     await this.createNewSessionForUser(user);
                 } else {
+                    console.error('❌ Fehler beim Beenden der Session - keine Zeilen betroffen');
                     this.sendToRenderer('rfid-scan-error', {
                         tagId,
                         message: 'Fehler beim Beenden der aktuellen Session',
@@ -973,6 +1039,21 @@ class WareneinlagerungMainApp {
                 message: `Fehler beim Erstellen einer neuen Session: ${error.message}`,
                 timestamp: new Date().toISOString()
             });
+        }
+    }
+
+    // ===== HILFSFUNKTION: DAUER FORMATIEREN =====
+    formatDuration(milliseconds) {
+        const seconds = Math.floor(milliseconds / 1000);
+        const minutes = Math.floor(seconds / 60);
+        const hours = Math.floor(minutes / 60);
+
+        if (hours > 0) {
+            return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
+        } else if (minutes > 0) {
+            return `${minutes}m ${seconds % 60}s`;
+        } else {
+            return `${seconds}s`;
         }
     }
 

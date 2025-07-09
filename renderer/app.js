@@ -1,6 +1,7 @@
 /**
  * RFID Wareneinlagerung - Hauptanwendung für parallele Sessions
  * Ermöglicht mehreren Mitarbeitern gleichzeitig zu arbeiten
+ * KORRIGIERT: Unterstützt Session-Ende + Neue Session Workflow
  */
 
 class WareneinlagerungApp {
@@ -152,28 +153,30 @@ class WareneinlagerungApp {
             this.showErrorModal('System-Fehler', data.error);
         });
 
+        // ===== KORRIGIERTE EVENT-HANDLER FÜR SESSION-MANAGEMENT =====
+
         // Benutzer-Anmeldung (neue Session)
         window.electronAPI.on('user-login', (data) => {
-            console.log('Neue Benutzer-Anmeldung:', data);
+            console.log('🔑 Neue Benutzer-Anmeldung:', data);
             this.handleUserLogin(data.user, data.session, data);
         });
 
-        // Benutzer-Abmeldung
-        window.electronAPI.on('user-logout', (data) => {
-            console.log('Benutzer-Abmeldung:', data);
-            this.handleUserLogout(data.user, data);
-        });
-
-        // ===== NEUER EVENT-HANDLER: SESSION-ENDED =====
+        // Session beendet (durch RFID-Rescan oder manuell)
         window.electronAPI.on('session-ended', (data) => {
-            console.log('Session beendet:', data);
+            console.log('📝 Session beendet:', data);
             this.handleSessionEnded(data);
         });
 
-        // Session neu gestartet (RFID-Rescan) - DEPRECATED, wird durch session-ended + user-login ersetzt
+        // Session neu gestartet (nur für manuelle Restarts über UI)
         window.electronAPI.on('session-restarted', (data) => {
-            console.log('Session neu gestartet (deprecated):', data);
+            console.log('🔄 Session neu gestartet:', data);
             this.handleSessionRestarted(data);
+        });
+
+        // Benutzer-Abmeldung (für manuelle Abmeldungen ohne neue Session)
+        window.electronAPI.on('user-logout', (data) => {
+            console.log('👋 Benutzer-Abmeldung:', data);
+            this.handleUserLogout(data.user, data);
         });
 
         // Session-Timer-Updates
@@ -181,14 +184,33 @@ class WareneinlagerungApp {
             this.handleSessionTimerUpdate(data);
         });
 
+        // Session-Fallback-Warnung
+        window.electronAPI.on('session-fallback-warning', (data) => {
+            console.warn('⚠️ SessionType Fallback verwendet:', data);
+            this.showNotification('warning', 'SessionType Fallback',
+                `${data.user.BenutzerName}: ${data.sessionType} verwendet`);
+        });
+
         // RFID-Fehler
         window.electronAPI.on('rfid-scan-error', (data) => {
             console.error('RFID-Fehler:', data);
             this.showNotification('error', 'RFID-Fehler', data.message);
         });
+
+        // QR-Scan detected (für erweiterte Benachrichtigungen)
+        window.electronAPI.on('qr-scan-detected', (data) => {
+            console.log('QR-Scan erkannt:', data);
+            // Zusätzliche Verarbeitung für QR-Scans falls nötig
+        });
+
+        // Dekodierung-Statistiken aktualisiert
+        window.electronAPI.on('decoding-stats-updated', (data) => {
+            console.log('📊 Dekodierung-Statistiken aktualisiert:', data.stats);
+            // UI mit neuen Statistiken aktualisieren falls nötig
+        });
     }
 
-    // ===== PARALLELE SESSION MANAGEMENT =====
+    // ===== KORRIGIERTE SESSION MANAGEMENT =====
     async handleUserLogin(user, session, eventData = {}) {
         console.log(`🔑 Benutzer-Anmeldung: ${user.BenutzerName} (Session ${session.ID})`);
 
@@ -200,7 +222,8 @@ class WareneinlagerungApp {
             department: user.Abteilung || '',
             startTime: new Date(session.StartTS),
             scanCount: 0,
-            isActive: true
+            isActive: true,
+            sessionType: eventData.sessionType || 'Wareneinlagerung'
         });
 
         // Session-spezifische QR-Code-Duplikat-Erkennung initialisieren
@@ -213,15 +236,67 @@ class WareneinlagerungApp {
         this.updateActiveUsersDisplay();
         this.showWorkspace();
 
-        // Spezielle Nachrichten für neue Sessions
-        if (eventData.isNewSession) {
-            this.showNotification('success', 'Neue Session', `${user.BenutzerName} ist bereit zum Arbeiten!`);
+        // Notification je nach Quelle und Typ
+        if (eventData.source === 'rfid_scan') {
+            if (eventData.isNewSession) {
+                this.showNotification('success', 'Neue Session gestartet',
+                    `${user.BenutzerName} ist bereit zum Arbeiten!`);
+            } else {
+                this.showNotification('success', 'Angemeldet',
+                    `${user.BenutzerName} ist bereit!`);
+            }
         } else {
-            this.showNotification('success', 'Angemeldet', `${user.BenutzerName} ist bereit!`);
+            this.showNotification('success', 'Angemeldet',
+                `${user.BenutzerName} ist bereit!`);
+        }
+
+        // Fallback-Warnung anzeigen falls nötig
+        if (eventData.fallbackUsed) {
+            this.showNotification('warning', 'SessionType Fallback',
+                `Verwendet: ${eventData.sessionType}`);
         }
 
         // Arbeitsbereich nur anzeigen wenn wir Benutzer haben
         this.updateWorkspaceVisibility();
+    }
+
+    // ===== KORRIGIERTER SESSION-ENDED HANDLER =====
+    async handleSessionEnded(data) {
+        console.log(`📝 Session beendet für ${data.user.BenutzerName}: ${Math.round(data.duration / 1000)}s`);
+
+        // Session aus lokaler Verwaltung entfernen
+        if (this.activeSessions.has(data.user.ID)) {
+            const session = this.activeSessions.get(data.user.ID);
+            this.activeSessions.delete(data.user.ID);
+
+            // Session-Timer stoppen
+            this.stopSessionTimer(data.user.ID);
+
+            // Session-spezifische QR-Codes entfernen
+            this.sessionScannedCodes.delete(data.sessionId);
+
+            // Falls ausgewählte Session, Auswahl zurücksetzen
+            if (this.selectedSession && this.selectedSession.userId === data.user.ID) {
+                this.selectedSession = null;
+                this.updateSelectedUserDisplay();
+                this.updateScannerInfo();
+            }
+
+            // UI aktualisieren
+            this.updateActiveUsersDisplay();
+            this.updateWorkspaceVisibility();
+
+            // Benachrichtigung anzeigen
+            const durationText = data.durationFormatted || this.formatDuration(data.duration);
+
+            if (data.source === 'rfid_scan') {
+                this.showNotification('info', 'Session beendet',
+                    `${data.user.BenutzerName}: ${durationText} gearbeitet`);
+            } else {
+                this.showNotification('success', 'Abgemeldet',
+                    `${data.user.BenutzerName} erfolgreich abgemeldet`);
+            }
+        }
     }
 
     async handleUserLogout(user, eventData = {}) {
@@ -253,73 +328,38 @@ class WareneinlagerungApp {
         this.showNotification('info', 'Abgemeldet', `${user.BenutzerName} wurde abgemeldet`);
     }
 
-    // ===== NEUER EVENT-HANDLER: SESSION ENDED =====
-    async handleSessionEnded(data) {
-        console.log(`📝 Session beendet für ${data.user.BenutzerName}: ${Math.round(data.duration / 1000)}s`);
-
-        // Session aus lokaler Verwaltung entfernen
-        this.activeSessions.delete(data.user.ID);
-
-        // Session-Timer stoppen
-        this.stopSessionTimer(data.user.ID);
-
-        // Session-spezifische QR-Codes entfernen
-        this.sessionScannedCodes.delete(data.sessionId);
-
-        // Falls ausgewählte Session, Auswahl zurücksetzen
-        if (this.selectedSession && this.selectedSession.userId === data.user.ID) {
-            this.selectedSession = null;
-            this.updateSelectedUserDisplay();
-            this.updateScannerInfo();
-        }
-
-        // UI aktualisieren
-        this.updateActiveUsersDisplay();
-        this.updateWorkspaceVisibility();
-
-        // Benachrichtigung anzeigen
-        const durationText = this.formatDuration(data.duration);
-        this.showNotification('info', 'Session beendet',
-            `${data.user.BenutzerName}: ${durationText} gearbeitet`);
-    }
-
-    formatDuration(milliseconds) {
-        const seconds = Math.floor(milliseconds / 1000);
-        const hours = Math.floor(seconds / 3600);
-        const minutes = Math.floor((seconds % 3600) / 60);
-        const remainingSeconds = seconds % 60;
-
-        if (hours > 0) {
-            return `${hours}h ${minutes}m ${remainingSeconds}s`;
-        } else if (minutes > 0) {
-            return `${minutes}m ${remainingSeconds}s`;
-        } else {
-            return `${remainingSeconds}s`;
-        }
-    }
-
+    // ===== SESSION-RESTART HANDLER (für UI-basierte Restarts) =====
     async handleSessionRestarted(data) {
-        console.log(`🔄 Session neu gestartet: ${data.user.BenutzerName}`);
+        console.log(`🔄 Session neu gestartet: ${data.userId}`);
 
         // Lokale Session-Daten aktualisieren
-        const session = this.activeSessions.get(data.user.ID);
+        const session = this.activeSessions.get(data.userId);
         if (session) {
-            session.startTime = new Date(data.newStartTime);
+            // Wichtig: Session-ID aktualisieren!
+            session.sessionId = data.newSessionId;
+            session.startTime = new Date();
+            session.scanCount = 0; // Reset der Scan-Anzahl
+
+            // Session-spezifische QR-Codes für neue Session initialisieren
+            this.sessionScannedCodes.delete(data.oldSessionId);
+            this.sessionScannedCodes.set(data.newSessionId, new Set());
 
             // Timer neu starten
-            this.stopSessionTimer(data.user.ID);
-            this.startSessionTimer(data.user.ID);
+            this.stopSessionTimer(data.userId);
+            this.startSessionTimer(data.userId);
+
+            // UI aktualisieren
+            this.updateActiveUsersDisplay();
+
+            // Falls diese Session ausgewählt ist, anzeigen aktualisieren
+            if (this.selectedSession && this.selectedSession.userId === data.userId) {
+                this.selectedSession.sessionId = data.newSessionId;
+                this.updateSelectedUserDisplay();
+            }
+
+            this.showNotification('success', 'Session neu gestartet',
+                'Timer wurde zurückgesetzt');
         }
-
-        // UI aktualisieren
-        this.updateActiveUsersDisplay();
-
-        // Falls diese Session ausgewählt ist, anzeigen aktualisieren
-        if (this.selectedSession && this.selectedSession.userId === data.user.ID) {
-            this.updateSelectedUserDisplay();
-        }
-
-        this.showNotification('info', 'Session neu gestartet', `${data.user.BenutzerName}: Timer zurückgesetzt`);
     }
 
     handleSessionTimerUpdate(data) {
@@ -383,6 +423,22 @@ class WareneinlagerungApp {
         if (session) {
             const duration = utils.calculateSessionDuration(session.startTime);
             document.getElementById('selectedSessionTime').textContent = utils.formatDuration(duration);
+        }
+    }
+
+    // ===== HILFSFUNKTIONEN FÜR SESSION-MANAGEMENT =====
+    formatDuration(milliseconds) {
+        const seconds = Math.floor(milliseconds / 1000);
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        const remainingSeconds = seconds % 60;
+
+        if (hours > 0) {
+            return `${hours}h ${minutes}m ${remainingSeconds}s`;
+        } else if (minutes > 0) {
+            return `${minutes}m ${remainingSeconds}s`;
+        } else {
+            return `${remainingSeconds}s`;
         }
     }
 
@@ -604,6 +660,11 @@ class WareneinlagerungApp {
         } else {
             loginSection.style.display = 'flex';
             workspace.style.display = 'none';
+
+            // QR-Scanner stoppen wenn keine aktiven Benutzer
+            if (this.scannerActive) {
+                this.stopQRScanner();
+            }
         }
     }
 
@@ -1532,6 +1593,54 @@ class WareneinlagerungApp {
         const modal = document.getElementById(modalId);
         modal.classList.remove('show');
     }
+
+    // ===== DEBUG-FUNKTIONEN FÜR ENTWICKLERKONSOLE =====
+
+    // Für Entwicklerkonsole - Session-Status prüfen
+    async debugSessionStatus() {
+        const activeSessions = await window.electronAPI.session.getAllActive();
+        const systemStatus = await window.electronAPI.system.getStatus();
+
+        console.log('=== SESSION DEBUG INFO ===');
+        console.log('Frontend Active Sessions:', this.activeSessions);
+        console.log('Backend Active Sessions:', activeSessions);
+        console.log('System Status:', systemStatus);
+        console.log('Session Timers:', this.sessionTimers);
+        console.log('QR Scanned Codes:', this.sessionScannedCodes);
+        console.log('Selected Session:', this.selectedSession);
+    }
+
+    // Für Entwicklerkonsole - RFID simulieren
+    async simulateRFID(tagId) {
+        console.log(`🧪 Simuliere RFID-Tag: ${tagId}`);
+        const result = await window.electronAPI.rfid.simulateTag(tagId);
+        console.log('Simulation Ergebnis:', result);
+        return result;
+    }
+
+    // Für Entwicklerkonsole - QR-Code simulieren
+    async simulateQR(qrData) {
+        console.log(`🧪 Simuliere QR-Code: ${qrData}`);
+        await this.handleQRCodeDetected(qrData);
+    }
+
+    // Für Entwicklerkonsole - Session-Management testen
+    async testSessionWorkflow() {
+        console.log('🧪 Teste Session-Workflow...');
+
+        // Simuliere RFID-Scan (erste Anmeldung)
+        await this.simulateRFID('A02062AB');
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Simuliere QR-Scan
+        await this.simulateQR('TEST^QR^CODE^123');
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Simuliere RFID-Scan (Session beenden + neue starten)
+        await this.simulateRFID('A02062AB');
+
+        console.log('🧪 Session-Workflow Test abgeschlossen');
+    }
 }
 
 // ===== APP INITIALIZATION =====
@@ -1566,4 +1675,19 @@ window.app = {
             window.wareneinlagerungApp.showSessionRestartModal(userId, sessionId);
         }
     }
+};
+
+// ===== GLOBAL DEBUG-FUNKTIONEN =====
+window.debug = {
+    // Session-Status prüfen
+    sessions: () => window.wareneinlagerungApp?.debugSessionStatus(),
+
+    // RFID simulieren
+    rfid: (tagId) => window.wareneinlagerungApp?.simulateRFID(tagId),
+
+    // QR-Code simulieren
+    qr: (qrData) => window.wareneinlagerungApp?.simulateQR(qrData),
+
+    // Session-Workflow testen
+    test: () => window.wareneinlagerungApp?.testSessionWorkflow()
 };

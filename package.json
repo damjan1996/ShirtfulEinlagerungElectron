@@ -6,6 +6,17 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --debug",
+
+    "start:gpu-safe": "electron . --disable-gpu --disable-gpu-compositing --force-cpu-draw",
+
+    "start:minimal": "electron . --disable-gpu --disable-gpu-compositing --disable-accelerated-2d-canvas --disable-web-security",
+
+    "start:debug": "electron . --enable-logging --log-level=2",
+
+    "start:production": "cross-env NODE_ENV=production ELECTRON_DISABLE_HARDWARE_ACCELERATION=true electron .",
+
+    "test:gpu": "electron . --disable-gpu-sandbox --disable-features=VizDisplayCompositor --log-level=1",
+
     "test": "jest",
     "test:unit": "jest tests/unit",
     "test:integration": "jest tests/integrations",
@@ -30,7 +41,7 @@
     "build:mac": "electron-builder --mac",
     "build:linux": "electron-builder --linux",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder",
+    "dist": "npm run build",
     "postinstall": "electron-builder install-app-deps",
     "setup": "node scripts/setup.js",
     "db:init": "node scripts/init-db.js",
@@ -65,6 +76,7 @@
     "@babel/core": "^7.23.7",
     "@babel/preset-env": "^7.23.7",
     "babel-jest": "^29.7.0",
+    "cross-env": "^7.0.3",
     "electron-builder": "^24.9.1",
     "eslint": "^8.56.0",
     "eslint-config-prettier": "^9.1.0",
@@ -87,7 +99,8 @@
       "parallelSessions": true,
       "sessionRestart": true,
       "multiUserQRScanning": true,
-      "rfidSessionManagement": true
+      "rfidSessionManagement": true,
+      "gpuOptimized": true
     },
     "limits": {
       "maxParallelSessions": 15,
@@ -124,7 +137,7 @@
       "wareneinlagerung": {
         "version": "1.0.0",
         "mode": "multi-user",
-        "description": "Wareneinlagerung mit parallelen Sessions"
+        "description": "Wareneinlagerung mit parallelen Sessions - GPU optimiert"
       }
     },
     "win": {
@@ -167,7 +180,8 @@
       "enableSessionRestart": true,
       "maxConcurrentUsers": 15,
       "sessionTimeoutHours": 8,
-      "autoLogoutDisabled": true
+      "autoLogoutDisabled": true,
+      "gpuOptimizationsEnabled": true
     }
   }
 }
